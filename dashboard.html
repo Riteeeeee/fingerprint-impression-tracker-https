@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ntrx — collision dashboard</title>
+  <style>
+    :root{
+      --bg:#07070b; --card:#14141f; --bd:#2a2a3d; --muted:#8a8aa3;
+      --accent:#8b7bff; --accent2:#b06cff; --green:#44e08b; --amber:#ffcf5c; --red:#ff6b6b;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:#e7e7f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px}
+    h1{font-size:24px;font-weight:800;letter-spacing:-.5px;margin:0 0 4px;
+       background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+    .sub{color:var(--muted);font-size:13px;margin:0 0 18px}
+    .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
+    input{background:#0c0c14;border:1px solid var(--bd);color:#e7e7f0;border-radius:8px;padding:8px 12px;font-size:13px;width:220px}
+    button{background:#1d1d33;border:1px solid #3a3a63;color:#cfc9ff;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer}
+    button:hover{background:#28284a;border-color:var(--accent);color:#fff}
+    label{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+    .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px}
+    .card .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+    .card .v{font-size:30px;font-weight:800;margin-top:6px}
+    .v.green{color:var(--green)} .v.amber{color:var(--amber)} .v.red{color:var(--red)}
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    @media(max-width:780px){.grid2{grid-template-columns:1fr}}
+    .panel{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin-bottom:16px}
+    .panel h2{font-size:14px;margin:0 0 12px;color:#cfc9ff;text-transform:uppercase;letter-spacing:.5px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #20202f}
+    th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase}
+    td.mono{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12px}
+    .pill{display:inline-block;padding:2px 8px;border-radius:6px;font-weight:700;font-size:12px}
+    .ok{background:rgba(68,224,139,.15);color:var(--green)}
+    .warn{background:rgba(255,207,92,.15);color:var(--amber)}
+    .bad{background:rgba(255,107,107,.15);color:var(--red)}
+    .chips{display:flex;gap:8px;flex-wrap:wrap}
+    .chip{background:#0c0c14;border:1px solid var(--bd);border-radius:8px;padding:6px 10px;font-size:12px}
+    .chip b{color:#fff;font-size:15px}
+    .err{color:var(--red);font-size:13px;margin-left:8px}
+    .dim{color:var(--muted)}
+  </style>
+</head>
+<body>
+  <h1>🛰️ ntrx — Collision Dashboard</h1>
+  <p class="sub">Monitors how identities are merged. High key-ID / IP fan-out on one identity = likely collision (different devices fused into one ID).</p>
+
+  <div class="bar">
+    <input id="token" type="password" placeholder="ADMIN_TOKEN (if set)" />
+    <button id="refresh">Refresh</button>
+    <label><input id="auto" type="checkbox" checked /> auto-refresh 5s</label>
+    <span id="status" class="dim"></span>
+    <span id="err" class="err"></span>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel">
+    <h2>How requests resolved</h2>
+    <div class="chips" id="matches"></div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>⚠️ Top collision suspects (most-merged IDs)</h2>
+      <table>
+        <thead><tr><th>Identity</th><th>keyIds</th><th>IPs</th><th>hashes</th><th>verdict</th></tr></thead>
+        <tbody id="suspects"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>🔴 Recent risky merges</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Identity</th><th>score</th><th>keyIds→</th></tr></thead>
+        <tbody id="merges"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    var $ = function (id) { return document.getElementById(id); };
+    var tokenEl = $('token');
+    try { tokenEl.value = localStorage.getItem('ntrx_admin_token') || ''; } catch (e) {}
+
+    function fmtTime(t) { try { return new Date(t).toLocaleTimeString(); } catch (e) { return '—'; } }
+
+    function card(k, v, cls) {
+      return '<div class="card"><div class="k">' + k + '</div><div class="v ' + (cls || '') + '">' + v + '</div></div>';
+    }
+
+    // verdict for a suspect: more distinct device keys + more IPs => more likely a collision
+    function verdict(keyIds, ips) {
+      if (keyIds >= 4 && ips >= 2) return '<span class="pill bad">collision?</span>';
+      if (keyIds >= 2) return '<span class="pill warn">review</span>';
+      return '<span class="pill ok">ok</span>';
+    }
+
+    function render(d) {
+      var rate = d.riskyMergeRate;
+      var rateCls = rate >= 0.4 ? 'red' : (rate >= 0.15 ? 'amber' : 'green');
+      var mdCls = d.multiDeviceIdentities > 0 ? 'amber' : 'green';
+
+      $('cards').innerHTML =
+        card('Identities', d.identities) +
+        card('Risky-merge rate', (rate * 100).toFixed(1) + '%', rateCls) +
+        card('Multi-device IDs', d.multiDeviceIdentities, mdCls) +
+        card('Total requests', d.matches.total);
+
+      var m = d.matches;
+      $('matches').innerHTML =
+        ['keyId', 'nonce', 'exact', 'fuzzy', 'split', 'fresh']
+          .map(function (k) { return '<div class="chip">' + k + ' <b>' + (m[k] || 0) + '</b></div>'; }).join('');
+
+      $('suspects').innerHTML = (d.topSuspects || []).map(function (s) {
+        return '<tr><td class="mono">' + s.id + '</td><td>' + s.keyIds + '</td><td>' + s.ips +
+               '</td><td>' + s.hashes + '</td><td>' + verdict(s.keyIds, s.ips) + '</td></tr>';
+      }).join('') || '<tr><td colspan="5" class="dim">none yet</td></tr>';
+
+      var mg = (d.recentRiskyMerges || []).slice().reverse();
+      $('merges').innerHTML = mg.map(function (e) {
+        return '<tr><td>' + fmtTime(e.t) + '</td><td class="mono">' + (e.id ? e.id.slice(0, 14) + '…' : '—') +
+               '</td><td>' + e.score + '</td><td>' + (e.keyIdsNow || '—') + '</td></tr>';
+      }).join('') || '<tr><td colspan="4" class="dim">no risky merges yet</td></tr>';
+
+      $('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+      $('err').textContent = '';
+    }
+
+    function load() {
+      var tok = tokenEl.value.trim();
+      try { localStorage.setItem('ntrx_admin_token', tok); } catch (e) {}
+      var url = '/stats' + (tok ? ('?token=' + encodeURIComponent(tok)) : '');
+      fetch(url, { cache: 'no-store' })
+        .then(function (r) {
+          if (r.status === 403) throw new Error('403 — wrong/missing ADMIN_TOKEN');
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(render)
+        .catch(function (e) { $('err').textContent = e.message; });
+    }
+
+    $('refresh').addEventListener('click', load);
+    tokenEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') load(); });
+
+    var timer = null;
+    function setupAuto() {
+      if (timer) { clearInterval(timer); timer = null; }
+      if ($('auto').checked) timer = setInterval(load, 5000);
+    }
+    $('auto').addEventListener('change', setupAuto);
+
+    load();
+    setupAuto();
+  })();
+  </script>
+</body>
+</html>
