@@ -34,7 +34,11 @@ const WEIGHTS = {
   locale: 1, tz: 1, platform: 1, cores: 1, touch: 1, vendor: 1, productSub: 1,
   gamut: 1, hdr: 1
 };
-const THRESHOLD = 13;
+const THRESHOLD = 13;          // same-IP fuzzy match (drift absorbed within one network)
+// Cross-IP match: when the fingerprint score is THIS high, link even on a
+// DIFFERENT network/IP. Lets the same device keep its ID after changing Wi-Fi /
+// mobile data, without the same-IP requirement. High enough to stay collision-safe.
+const STRONG_THRESHOLD = 16;
 
 // When on (default), a fresh per-origin nonce arriving with an ALREADY-KNOWN
 // fingerprint on the SAME IP is treated as a *different physical unit* of the
@@ -90,12 +94,15 @@ function save() {
 function newId() { return PREFIX + crypto.randomBytes(32).toString("hex"); } // 69 chars
 
 function coreHash(s) {
-  // Cross-site fingerprint: stable model+browser signals only.
-  // Deliberately EXCLUDES nonce + quota (those are per-origin / per-unit).
+  // Cross-site fingerprint: ONLY rock-stable, network-independent signals.
+  // Deliberately EXCLUDES volatile fields that drift on the same device:
+  //   dpr (zoom), avail (mobile toolbar), orient (rotation), dark (auto dark
+  //   mode), gamut/hdr (display mode), tzoff (DST), nonce/quota (per-origin).
+  // Keeping these out means a phone rotating / toggling dark mode / changing
+  // network still resolves to the SAME id via this exact hash (which ignores IP).
   const basis = [
-    s.canvas, s.audio, s.webglV, s.webglR, s.screen, s.avail, s.dpr, s.orient,
-    s.tz, s.locale, s.tzoff, s.platform, s.cores, s.touch, s.vendor,
-    s.productSub, s.dark, s.gamut, s.hdr
+    s.canvas, s.audio, s.webglV, s.webglR, s.screen,
+    s.tz, s.locale, s.platform, s.cores, s.touch, s.vendor, s.productSub
   ].join("|");
   return crypto.createHash("sha256").update(basis).digest("hex");
 }
@@ -163,20 +170,24 @@ function identify(sig, ip) {
       return exact.id;
     }
 
-    // 3) fuzzy match, but only among identities seen from the same IP
+    // 3) fuzzy match over ALL identities (score is the device fingerprint).
+    //    - same IP  + score >= THRESHOLD        -> match (absorbs minor drift)
+    //    - any IP   + score >= STRONG_THRESHOLD -> match (survives a network change)
     let best = null, bestScore = 0;
     for (const r of records) {
-      if (r.ips.indexOf(ip) === -1) continue;
       const s = score(sig, r.sig);
       if (s > bestScore) { bestScore = s; best = r; }
     }
-    if (best && bestScore >= THRESHOLD) {
-      best.hashes.push(h);
-      byCore.set(h, best);
-      touch(best, ip, sig, nonce, keyId);
-      stats.fuzzy++;
-      logFuzzy({ t: Date.now(), id: best.id, score: bestScore, ip: ip, keyId: keyId, keyIdsNow: best.keyIds.length });
-      return best.id;
+    if (best) {
+      const sameIp = best.ips.indexOf(ip) !== -1;
+      if ((sameIp && bestScore >= THRESHOLD) || bestScore >= STRONG_THRESHOLD) {
+        best.hashes.push(h);
+        byCore.set(h, best);
+        touch(best, ip, sig, nonce, keyId);
+        stats.fuzzy++;
+        logFuzzy({ t: Date.now(), id: best.id, score: bestScore + (sameIp ? "" : " (cross-IP)"), ip: ip, keyId: keyId, keyIdsNow: best.keyIds.length });
+        return best.id;
+      }
     }
   } else {
     stats.split++;
