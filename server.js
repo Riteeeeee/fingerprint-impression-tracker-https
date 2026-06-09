@@ -42,12 +42,12 @@ const CONF_SAME_IP   = 0.55;   // same network: looser (absorbs drift)
 const CONF_CROSS_IP  = 0.72;   // different network: stricter (stay collision-safe)
 const MIN_COMPARABLE = 6;      // need at least this much comparable weight to trust a match
 
-// When on (default), a fresh per-origin nonce arriving with an ALREADY-KNOWN
-// fingerprint on the SAME IP is treated as a *different physical unit* of the
-// same model, so identical devices get distinct ids. Trade-off: on Safari the
-// nonce is partitioned per site, so this can also split one device across sites.
-// Set UNIQUE_UNITS=0 to prioritise cross-site linking instead.
-const UNIQUE_UNITS = process.env.UNIQUE_UNITS !== "0";
+// STABILITY-FIRST default (OFF). When OFF, the same device ALWAYS keeps its id —
+// a fresh nonce/keyId on a known fingerprint is treated as the same device, never
+// split. This is what guarantees the id never changes across cookie clears / new
+// sessions. Set UNIQUE_UNITS=1 ONLY if you'd rather separate two identical-model
+// devices at the cost of that stability (they look identical to the server).
+const UNIQUE_UNITS = process.env.UNIQUE_UNITS === "1";
 
 // ---------- store ----------
 let records = [];                 // [{ id, hashes:[], nonces:[], ips:[], sig:{}, createdAt, lastSeen }]
