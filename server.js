@@ -227,8 +227,10 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  if (req.method === "GET" && (url === "/" || url === "/demo.html" || url === "/testcase.html")) {
-    const file = url === "/testcase.html" ? "testcase.html" : "demo.html";
+  if (req.method === "GET" && (url === "/" || url === "/demo.html" || url === "/testcase.html" || url === "/dashboard" || url === "/dashboard.html")) {
+    const file = url === "/testcase.html" ? "testcase.html"
+               : (url === "/dashboard" || url === "/dashboard.html") ? "dashboard.html"
+               : "demo.html";
     cors(res, origin);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return fs.readFile(path.join(__dirname, file), (e, buf) => {
