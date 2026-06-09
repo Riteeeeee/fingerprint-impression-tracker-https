@@ -20,25 +20,27 @@ const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "data.json");
 const SCRIPT_FILE = path.join(__dirname, "id-generator.js");
 const PREFIX = "ntrx_";
 
-// Fuzzy-match threshold (weights below sum to 38). With the SAME IP this links
-// two slightly-different fingerprints (e.g. Safari vs the Instagram in-app browser)
-// to one identity. Exact core-hash match links across IPs too.
+// Per-signal weights = entropy (how distinguishing) x stability (survives revisits).
+// Matching is CONFIDENCE based: confidence = matchedWeight / comparableWeight, so
+// it self-normalises whether or not a signal (e.g. server-side JA4) is present.
 //
-// keyId carries the heaviest weight (8): it is a cryptographic per-device key
-// (sha256 of a non-extractable browser keypair), far more reliable than any
-// passive fingerprint field — it cannot collide between two identical devices.
-// A matching keyId also short-circuits as a tier-0 exact match in identify().
+//   server-side (spoof-proof, cross-site)  ja4, h2fp   -- only if a TLS/HTTP2 proxy
+//                                                          forwards them as headers
+//   high-entropy + stable                  voices, fonts, canvas, webglR/webglP
+//   medium                                 screen, ua, tz, locale
+//   low / high-collision                   the rest (weight 1)
+// keyId / nonce are NOT here: they are handled as exact tiers (0/1) in identify().
 const WEIGHTS = {
-  keyId: 8,
-  canvas: 3, audio: 3, webglR: 2, screen: 2, avail: 1, dpr: 1, orient: 1,
-  locale: 1, tz: 1, platform: 1, cores: 1, touch: 1, vendor: 1, productSub: 1,
-  gamut: 1, hdr: 1
+  ja4: 8, h2fp: 5,
+  voices: 5, fonts: 4, canvas: 3, webglR: 2, webglP: 2, screen: 2, ua: 2,
+  tz: 1, locale: 1, audio: 1, avail: 1, dpr: 1, orient: 1,
+  platform: 1, cores: 1, touch: 1, vendor: 1, productSub: 1,
+  gamut: 1, hdr: 1, deviceMemory: 1, colorDepth: 1, dnt: 1, cookieEnabled: 1
 };
-const THRESHOLD = 13;          // same-IP fuzzy match (drift absorbed within one network)
-// Cross-IP match: when the fingerprint score is THIS high, link even on a
-// DIFFERENT network/IP. Lets the same device keep its ID after changing Wi-Fi /
-// mobile data, without the same-IP requirement. High enough to stay collision-safe.
-const STRONG_THRESHOLD = 16;
+// Confidence thresholds for the fuzzy tier:
+const CONF_SAME_IP   = 0.55;   // same network: looser (absorbs drift)
+const CONF_CROSS_IP  = 0.72;   // different network: stricter (stay collision-safe)
+const MIN_COMPARABLE = 6;      // need at least this much comparable weight to trust a match
 
 // When on (default), a fresh per-origin nonce arriving with an ALREADY-KNOWN
 // fingerprint on the SAME IP is treated as a *different physical unit* of the
@@ -94,25 +96,36 @@ function save() {
 function newId() { return PREFIX + crypto.randomBytes(32).toString("hex"); } // 69 chars
 
 function coreHash(s) {
-  // Cross-site fingerprint: ONLY rock-stable, network-independent signals.
-  // Deliberately EXCLUDES volatile fields that drift on the same device:
-  //   dpr (zoom), avail (mobile toolbar), orient (rotation), dark (auto dark
-  //   mode), gamut/hdr (display mode), tzoff (DST), nonce/quota (per-origin).
-  // Keeping these out means a phone rotating / toggling dark mode / changing
-  // network still resolves to the SAME id via this exact hash (which ignores IP).
+  // Cross-site fingerprint: ONLY rock-stable, DETERMINISTIC, network-independent
+  // signals — the ones that stay identical across storage/cookie clears too.
+  // EXCLUDED on purpose:
+  //   audio  -> WebAudio is non-deterministic (noise / 1.5s timeout -> "na"),
+  //   dpr/avail/orient/dark/gamut/hdr -> change on zoom/rotate/toolbar/dark-mode,
+  //   tzoff  -> DST,  nonce/quota/keyId -> per-origin (wiped on clear).
+  // canvas + WebGL + screen + nav fields survive a full cookie/site-data clear,
+  // so the SAME device re-resolves to the SAME id. (audio still helps in fuzzy.)
   const basis = [
-    s.canvas, s.audio, s.webglV, s.webglR, s.screen,
+    s.canvas, s.fonts, s.voices, s.webglV, s.webglR, s.webglP, s.screen,
     s.tz, s.locale, s.platform, s.cores, s.touch, s.vendor, s.productSub
   ].join("|");
   return crypto.createHash("sha256").update(basis).digest("hex");
 }
 
-function score(a, b) {
-  let n = 0;
+// Compare two signal sets -> { matched, comparable, confidence }.
+// Only signals PRESENT (non-"na") in BOTH sides count toward "comparable", so
+// confidence isn't punished for signals one side happens not to send.
+function compare(a, b) {
+  let matched = 0, comparable = 0;
   for (const k in WEIGHTS) {
-    if (a[k] != null && b[k] != null && String(a[k]) === String(b[k]) && String(a[k]) !== "na") n += WEIGHTS[k];
+    const av = a[k], bv = b[k];
+    const aok = av != null && av !== "" && String(av) !== "na";
+    const bok = bv != null && bv !== "" && String(bv) !== "na";
+    if (aok && bok) {
+      comparable += WEIGHTS[k];
+      if (String(av) === String(bv)) matched += WEIGHTS[k];
+    }
   }
-  return n;
+  return { matched, comparable, confidence: comparable ? matched / comparable : 0 };
 }
 
 function touch(r, ip, sig, nonce, keyId) {
@@ -170,22 +183,24 @@ function identify(sig, ip) {
       return exact.id;
     }
 
-    // 3) fuzzy match over ALL identities (score is the device fingerprint).
-    //    - same IP  + score >= THRESHOLD        -> match (absorbs minor drift)
-    //    - any IP   + score >= STRONG_THRESHOLD -> match (survives a network change)
-    let best = null, bestScore = 0;
+    // 3) fuzzy match over ALL identities by CONFIDENCE (matched / comparable weight).
+    //    - same IP  + confidence >= CONF_SAME_IP   -> match (absorbs drift)
+    //    - any IP   + confidence >= CONF_CROSS_IP  -> match (survives network change)
+    let best = null, bestCmp = { confidence: 0, comparable: 0 };
     for (const r of records) {
-      const s = score(sig, r.sig);
-      if (s > bestScore) { bestScore = s; best = r; }
+      const c = compare(sig, r.sig);
+      if (c.comparable < MIN_COMPARABLE) continue;
+      if (c.confidence > bestCmp.confidence) { bestCmp = c; best = r; }
     }
     if (best) {
       const sameIp = best.ips.indexOf(ip) !== -1;
-      if ((sameIp && bestScore >= THRESHOLD) || bestScore >= STRONG_THRESHOLD) {
+      const conf = bestCmp.confidence;
+      if ((sameIp && conf >= CONF_SAME_IP) || conf >= CONF_CROSS_IP) {
         best.hashes.push(h);
         byCore.set(h, best);
         touch(best, ip, sig, nonce, keyId);
         stats.fuzzy++;
-        logFuzzy({ t: Date.now(), id: best.id, score: bestScore + (sameIp ? "" : " (cross-IP)"), ip: ip, keyId: keyId, keyIdsNow: best.keyIds.length });
+        logFuzzy({ t: Date.now(), id: best.id, score: conf.toFixed(2) + (sameIp ? "" : " (cross-IP)"), ip: ip, keyId: keyId, keyIdsNow: best.keyIds.length });
         return best.id;
       }
     }
@@ -301,6 +316,13 @@ const server = http.createServer((req, res) => {
       cors(res, origin);
       res.setHeader("Content-Type", "application/json");
       if (!sig || typeof sig !== "object") { res.writeHead(400); return res.end(JSON.stringify({ error: "bad signals" })); }
+      // Server-side, spoof-proof signals — only present if a TLS/HTTP2-terminating
+      // front (nginx+ja4 module, Cloudflare, the ja4-fingerprint server) forwards
+      // them. JS can't set these, so they're high-trust when available.
+      const ja4 = req.headers["x-ja4"] || req.headers["cf-ja4"] || req.headers["x-ja4-fingerprint"];
+      if (ja4) sig.ja4 = String(ja4);
+      const h2 = req.headers["x-h2fp"] || req.headers["x-http2-fingerprint"];
+      if (h2) sig.h2fp = String(h2);
       const id = identify(sig, clientIp(req));
       res.writeHead(200); res.end(JSON.stringify({ id }));
     });
