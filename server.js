@@ -49,6 +49,15 @@ const byCore = new Map();         // coreHash -> record
 const byNonce = new Map();        // per-origin nonce -> record
 const byKey = new Map();          // per-device crypto keyId -> record
 
+// ---------- collision / match telemetry ----------
+// How each /id request was resolved. Fuzzy + (in UNIQUE_UNITS=0) bare exact-hash
+// merges are the COLLISION-PRONE paths: that's where two different devices can be
+// fused into one identity. We count them and keep a log of fuzzy merges to review.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const stats = { total: 0, keyId: 0, nonce: 0, exact: 0, fuzzy: 0, split: 0, fresh: 0 };
+const fuzzyLog = [];              // recent fuzzy merges: {t, id, score, ip, keyId}
+function logFuzzy(e) { fuzzyLog.push(e); if (fuzzyLog.length > 300) fuzzyLog.shift(); }
+
 function load() {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -112,6 +121,7 @@ function identify(sig, ip) {
   const keyId = (sig.keyId && sig.keyId !== "na") ? sig.keyId : null;
   const nonce = (sig.nonce && sig.nonce !== "na") ? sig.nonce : null;
   const h = coreHash(sig);
+  stats.total++;
 
   // 0) known crypto keyId — STRONGEST signal: cryptographic proof of the same
   //    physical device. Cannot collide between two identical units.
@@ -119,6 +129,7 @@ function identify(sig, ip) {
     const r = byKey.get(keyId);
     if (r.hashes.indexOf(h) === -1) { r.hashes.push(h); byCore.set(h, r); }
     touch(r, ip, sig, nonce, keyId);
+    stats.keyId++;
     return r.id;
   }
 
@@ -127,6 +138,7 @@ function identify(sig, ip) {
     const r = byNonce.get(nonce);
     if (r.hashes.indexOf(h) === -1) { r.hashes.push(h); byCore.set(h, r); }
     touch(r, ip, sig, nonce, keyId);
+    stats.nonce++;
     return r.id;
   }
 
@@ -139,8 +151,17 @@ function identify(sig, ip) {
   const splitUnit = UNIQUE_UNITS && exact && exact.ips.indexOf(ip) !== -1 && freshUnitMarker;
 
   if (!splitUnit) {
-    // 2) exact device match — works even across networks / IP changes
-    if (exact) { touch(exact, ip, sig, nonce, keyId); return exact.id; }
+    // 2) exact device match — works even across networks / IP changes.
+    // COLLISION RISK: a brand-new keyId landing on an existing fingerprint means
+    // either the same device on a new origin (legit) or a different identical
+    // device (collision). We flag it when it carries an unseen keyId.
+    if (exact) {
+      const collisionRisk = !!keyId && exact.keyIds.length > 0 && exact.keyIds.indexOf(keyId) === -1;
+      touch(exact, ip, sig, nonce, keyId);
+      stats.exact++;
+      if (collisionRisk) logFuzzy({ t: Date.now(), id: exact.id, score: "exact-hash", ip: ip, keyId: keyId, keyIdsNow: exact.keyIds.length });
+      return exact.id;
+    }
 
     // 3) fuzzy match, but only among identities seen from the same IP
     let best = null, bestScore = 0;
@@ -153,8 +174,12 @@ function identify(sig, ip) {
       best.hashes.push(h);
       byCore.set(h, best);
       touch(best, ip, sig, nonce, keyId);
+      stats.fuzzy++;
+      logFuzzy({ t: Date.now(), id: best.id, score: bestScore, ip: ip, keyId: keyId, keyIdsNow: best.keyIds.length });
       return best.id;
     }
+  } else {
+    stats.split++;
   }
 
   // 4) new identity (also the unit-split path)
@@ -167,6 +192,7 @@ function identify(sig, ip) {
   if (nonce) byNonce.set(nonce, r);
   if (keyId) byKey.set(keyId, r);
   save();
+  stats.fresh++;
   return r.id;
 }
 
@@ -209,6 +235,43 @@ const server = http.createServer((req, res) => {
       if (e) { res.writeHead(500); return res.end(file + " unavailable"); }
       res.writeHead(200); res.end(buf);
     });
+  }
+
+  if (req.method === "GET" && url === "/stats") {
+    cors(res, origin);
+    res.setHeader("Content-Type", "application/json");
+    // Gate with ADMIN_TOKEN if one is set (?token=... or X-Admin-Token header).
+    if (ADMIN_TOKEN) {
+      const q = (req.url.split("?")[1] || "").split("&").reduce((a, kv) => { const [k, v] = kv.split("="); a[k] = decodeURIComponent(v || ""); return a; }, {});
+      const tok = q.token || req.headers["x-admin-token"];
+      if (tok !== ADMIN_TOKEN) { res.writeHead(403); return res.end(JSON.stringify({ error: "forbidden" })); }
+    }
+
+    // Fan-out histogram: how many identities have N distinct device keyIds.
+    // High keyId/IP fan-out on one identity = likely collision (different devices
+    // fused), since a single device on a few sites yields only a few keyIds.
+    const hist = { keyIds: {}, ips: {} };
+    const bump = (m, n) => { const b = n >= 5 ? "5+" : String(n); m[b] = (m[b] || 0) + 1; };
+    let multiKey = 0;
+    const suspects = [];
+    for (const r of records) {
+      const k = (r.keyIds || []).length, i = (r.ips || []).length;
+      bump(hist.keyIds, k); bump(hist.ips, i);
+      if (k >= 2) multiKey++;
+      suspects.push({ id: r.id.slice(0, 16) + "…", keyIds: k, ips: i, hashes: r.hashes.length, lastSeen: r.lastSeen });
+    }
+    suspects.sort((a, b) => (b.keyIds - a.keyIds) || (b.ips - a.ips) || (b.hashes - a.hashes));
+
+    res.writeHead(200);
+    return res.end(JSON.stringify({
+      identities: records.length,
+      matches: stats,                                 // how requests resolved (keyId/nonce/exact/fuzzy/split/fresh)
+      riskyMergeRate: stats.total ? +(((stats.fuzzy + stats.exact) / stats.total)).toFixed(3) : 0,
+      multiDeviceIdentities: multiKey,                // identities holding >=2 keyIds (collision candidates)
+      fanout: hist,                                   // distribution of keyIds/ips per identity
+      topSuspects: suspects.slice(0, 25),             // most-merged identities — inspect these
+      recentRiskyMerges: fuzzyLog.slice(-50)          // fuzzy + bare-exact merges with an unseen keyId
+    }, null, 2));
   }
 
   if (req.method === "GET" && url === "/health") {
