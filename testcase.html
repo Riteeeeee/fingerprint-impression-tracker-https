@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+
+<!-- This site can be hosted on https://testsite1.com or https://dadridekho.com or any other site -->
+<!-- For one user - the ID should stay the same across site (for same browser) -->
+
+<head>
+    <script type="text/javascript" src="/id-generator.js"></script>
+    <!-- This script will expose a variable called iDx -->
+    <!-- My script below is guranteed to load after yours -->
+
+    <script>
+        iDx.config = {
+            /* Any config variables you want before I call next function */
+        }
+
+        window.addEventListener("DOMContentLoaded", () => {
+           console.log("DOM is fully loaded! Going to aquire ID.");
+           iDx.onIdAquired = function (ident) {
+               const element = document.getElementById("identifier");
+               element.innerHTML = "Id from id-generator = " + ident.toString();
+           }
+        });
+
+    </script>
+</head>
+
+<body>
+    <h1 id="identifier">Aquiring ID...</h1>
+</body>

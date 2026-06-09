@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NitroCommerce — <span id="tab-site">localhost</span></title>
+
+  <!-- The drop-in identity script (same one used in testcase.html). -->
+  <script type="text/javascript" src="/id-generator.js"></script>
+
+  <style>
+    :root {
+      --bg: #07070b;
+      --card: #14141f;
+      --card-border: #2a2a3d;
+      --pill-bg: #1d1d33;
+      --pill-border: #3a3a63;
+      --accent: #8b7bff;
+      --accent2: #b06cff;
+      --muted: #8a8aa3;
+      --id-green: #44e08b;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: #e7e7f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 620px;
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: 18px;
+      padding: 34px 32px 30px;
+      box-shadow: 0 24px 80px rgba(0,0,0,0.5);
+    }
+    h1 {
+      margin: 0 0 18px; text-align: center;
+      font-size: 28px; font-weight: 800; letter-spacing: -0.5px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .rocket { -webkit-text-fill-color: initial; }
+    .pill {
+      display: block; width: fit-content; margin: 0 auto 14px;
+      background: var(--pill-bg); border: 1px solid var(--pill-border);
+      color: #c9c4ff; font-size: 14px; font-weight: 600;
+      padding: 7px 16px; border-radius: 999px;
+    }
+    .pill b { color: #fff; }
+    .hint { text-align: center; color: var(--muted); font-size: 14px; margin: 0 0 18px; }
+    .idbox {
+      background: #050507; border: 1px solid #1c1c2b; border-radius: 12px;
+      min-height: 64px; display: flex; align-items: center; justify-content: center;
+      padding: 18px 20px; margin-bottom: 22px;
+      font-family: "SF Mono", ui-monospace, Menlo, monospace;
+      font-size: 15px; color: var(--id-green); font-weight: 700;
+      word-break: break-all; text-align: center; line-height: 1.5;
+      transition: color .2s;
+    }
+    .idbox.loading { color: var(--id-green); opacity: .7; }
+    .idbox.error { color: #ff6b6b; }
+    .btns { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+    button {
+      background: var(--pill-bg); border: 1px solid var(--pill-border);
+      color: #cfc9ff; font-size: 14px; font-weight: 600;
+      padding: 9px 16px; border-radius: 10px; cursor: pointer;
+      transition: all .15s;
+    }
+    button:hover { background: #28284a; border-color: var(--accent); color: #fff; }
+    button:active { transform: translateY(1px); }
+    button.active { background: linear-gradient(90deg, var(--accent), var(--accent2)); color: #fff; border-color: transparent; }
+    button.clear { color: #ff8b8b; border-color: #5a2a3a; }
+    button.clear:hover { background: #3a1f29; color: #fff; }
+    .foot { text-align: center; color: #55556b; font-size: 12px; margin-top: 18px; }
+    .same-tag {
+      display: inline-block; margin-left: 8px; font-size: 12px; font-weight: 700;
+      color: #0b0b12; background: var(--id-green); padding: 2px 8px; border-radius: 6px;
+      vertical-align: middle;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1><span class="rocket">🚀</span> NitroCommerce Tracker</h1>
+    <span class="pill">Simulating: <b id="site-name">localhost</b></span>
+    <p class="hint">Check console for ID.</p>
+
+    <div id="idbox" class="idbox loading">Acquiring ID…</div>
+
+    <div class="btns">
+      <button data-site="shop.com">shop.com</button>
+      <button data-site="crow.com">crow.com</button>
+      <button data-site="pewpie.com">pewpie.com</button>
+      <button data-site="Registry">Registry</button>
+      <button class="clear" id="clear-btn">Clear</button>
+    </div>
+
+    <p class="foot" id="foot">Same browser → same ID across every "site", with no cookies.</p>
+  </div>
+
+  <script>
+  (function () {
+    var idbox    = document.getElementById('idbox');
+    var siteName = document.getElementById('site-name');
+    var tabSite  = document.getElementById('tab-site');
+    var foot     = document.getElementById('foot');
+    var btns     = document.querySelectorAll('button[data-site]');
+
+    var firstId = null;   // the first ID we saw this session (closure-scoped)
+
+    function setActive(site) {
+      btns.forEach(function (b) { b.classList.toggle('active', b.dataset.site === site); });
+    }
+    function showLoading() {
+      idbox.classList.remove('error'); idbox.classList.add('loading');
+      idbox.textContent = 'Acquiring ID…';
+    }
+
+    // id-generator calls this ONCE per (re)acquisition. Assigned a single time
+    // below — never reassigned (reassigning re-triggers the immediate-fire setter).
+    function render(id) {
+      var first = idbox.getAttribute('data-first-id');
+      var isFirst = !first;
+      if (isFirst) { idbox.setAttribute('data-first-id', id); first = id; }
+      var same = !isFirst && id === first;
+      idbox.classList.remove('loading', 'error');
+      idbox.innerHTML = id + (same ? ' <span class="same-tag">SAME ✓</span>' : '');
+      foot.textContent = isFirst
+        ? 'First ID acquired. Now click another "site" to verify it stays the same.'
+        : (same
+            ? '✓ Identical ID returned — cross-site identity works without cookies.'
+            : '✗ ID changed (unexpected).');
+    }
+
+    // Simulate landing on a brand-new site: a real different origin on Safari has
+    // NO shared storage (cache, nonce and the crypto key are all partitioned), so
+    // we wipe them. The only thing that survives across origins is the device
+    // itself → the server must re-identify us from fingerprint + IP alone.
+    function wipePartitionedStorage() {
+      try { localStorage.removeItem('ntrx_id'); } catch (e) {}
+      try { localStorage.removeItem('ntrx_nonce'); } catch (e) {}
+      return new Promise(function (resolve) {
+        try {
+          var r = indexedDB.deleteDatabase('ntrx');
+          r.onsuccess = r.onerror = r.onblocked = function () { resolve(); };
+        } catch (e) { resolve(); }
+      });
+    }
+
+    function visitSite(site) {
+      setActive(site);
+      siteName.textContent = site;
+      tabSite.textContent = site;
+      document.title = 'NitroCommerce — ' + site;
+      showLoading();
+      wipePartitionedStorage().then(function () { window.iDx.reacquire(); });
+    }
+
+    window.iDx.onIdAquired = render;   // set exactly once
+
+    btns.forEach(function (b) {
+      b.addEventListener('click', function () { visitSite(b.dataset.site); });
+    });
+
+    document.getElementById('clear-btn').addEventListener('click', function () {
+      wipePartitionedStorage().then(function () {
+        idbox.removeAttribute('data-first-id');
+        setActive(null);
+        siteName.textContent = 'localhost';
+        tabSite.textContent = 'localhost';
+        document.title = 'NitroCommerce — localhost';
+        showLoading();
+        window.iDx.reacquire();
+      });
+    });
+  })();
+  </script>
+</body>
+</html>

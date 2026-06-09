@@ -1,0 +1,58 @@
+ntrx — cross-site identity without third-party cookies
+======================================================
+
+WHAT'S IN HERE
+  server.js         the identity server (zero dependencies, Node 18+)
+  id-generator.js   the drop-in client script you put on each site
+  testcase.html     the hackathon test page (points at /id-generator.js)
+  README.md         full design write-up + t3.small / nginx / TLS deploy guide
+  package.json      metadata; `npm start` == `node server.js`
+
+------------------------------------------------------------------
+TRY IT LOCALLY IN 30 SECONDS
+------------------------------------------------------------------
+1. Start the server:
+       cd ntrx-id
+       node server.js                 # listens on http://localhost:8080
+
+2. Edit testcase.html — change the script src to your server:
+       <script src="//localhost:8080/id-generator.js"></script>
+   (or just open the included file after pointing it at localhost:8080)
+
+3. Open testcase.html in a browser. The console prints:
+       ID: ntrx_<64 hex chars>
+   and the page shows "Id from id-generator = ntrx_...".
+
+4. Open the SAME page served from a different hostname (e.g. add
+   "127.0.0.1 testsite1.com testsite2.com" to /etc/hosts and load it via
+   each name). Same browser  ->  SAME id across both "sites". That's the point.
+
+   Quick check the server's matching directly:
+       curl -X POST localhost:8080/id -H 'Content-Type: application/json' \
+         -d '{"canvas":"a","audio":"1","webglV":"Apple","webglR":"Apple GPU","screen":"390x844x24x3","tz":"Asia/Kolkata","platform":"iPhone","cores":4,"touch":5}'
+   Run it twice -> identical id.
+
+------------------------------------------------------------------
+HOW IT WORKS (1 paragraph)
+------------------------------------------------------------------
+Safari blocks third-party cookies AND partitions third-party storage per site,
+so nothing stored in the browser can link site A to site B. The only thing that
+crosses origins is the device. So: localStorage is used only as a per-site cache;
+on a cache miss the script sends a device fingerprint to a central server, which
+does get_or_create keyed on (fingerprint + client IP) and returns a stable id.
+No cookies anywhere -> the third-party-cookie restriction simply doesn't apply.
+
+------------------------------------------------------------------
+GOING LIVE (summary — full steps in README.md)
+------------------------------------------------------------------
+- Host server.js + id-generator.js on a t3.small with an Elastic IP.
+- Point a domain at it. HTTPS is REQUIRED (Safari blocks mixed content on
+  https sites): put nginx + Let's Encrypt in front, proxy 443 -> :8080, and
+  forward the client IP:  proxy_set_header X-Forwarded-For $remote_addr;
+- Put <script src="//your-domain.com/id-generator.js"></script> on each site.
+- Verify: curl https://your-domain.com/health
+
+The client API matches the test case:
+  iDx.config        optional ({endpoint} supported)
+  iDx.onIdAquired   callback(id); fires even if assigned after the id resolves
+  iDx.id            the resolved id

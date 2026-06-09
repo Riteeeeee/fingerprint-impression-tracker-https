@@ -1,0 +1,33 @@
+# Render Blueprint — deploy this repo as a web service.
+# In Render: New + → "Blueprint" → connect this repo. Render reads this file.
+# (Or create a Web Service manually with the build/start commands below.)
+services:
+  - type: web
+    name: ntrx-id
+    runtime: node
+    plan: free                 # free tier gives a stable https://<name>.onrender.com URL
+    region: singapore          # closest to India; change to oregon/frankfurt if you like
+    buildCommand: npm install  # zero dependencies, but Render expects a build step
+    startCommand: npm start    # == node server.js
+    healthCheckPath: /health   # Render pings this; server returns {"ok":true,...}
+    autoDeploy: true           # redeploy on every git push
+    envVars:
+      - key: UNIQUE_UNITS
+        value: "0"             # 0 = cross-site consistency (same ID survives cache clears)
+      - key: NODE_VERSION
+        value: "22"
+
+    # ---------------------------------------------------------------------
+    # PERSISTENCE (optional, needs a PAID instance — disks aren't on free):
+    # The free tier filesystem is EPHEMERAL: data.json resets on every deploy
+    # and on cold-start after the instance spins down (~15 min idle). IDs are
+    # still stable while the instance stays warm. For truly "infinite" IDs,
+    # upgrade the plan and uncomment the disk + DATA_FILE below.
+    # ---------------------------------------------------------------------
+    # disk:
+    #   name: ntrx-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
+    # then add to envVars:
+    #   - key: DATA_FILE
+    #     value: /var/data/data.json
