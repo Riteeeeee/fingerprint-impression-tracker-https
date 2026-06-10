@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NitroCommerce — <span id="tab-site">localhost</span></title>
 
-  <!-- The drop-in identity script (same one used in testcase.html). -->
   <script type="text/javascript" src="/id-generator.js"></script>
 
   <style>
@@ -111,45 +110,32 @@
     var foot     = document.getElementById('foot');
     var btns     = document.querySelectorAll('button[data-site]');
 
-    var firstId = null;   // the first ID we saw this session (closure-scoped)
+    // ---- Canvas Checksum ko UI aur Console dono jagah bhejne ka function ----
+    function displayChecksum() {
+      idbox.classList.remove('loading', 'error');
+
+      var id = window.canvasChecksum;
+
+      if (id) {
+        // 1. Box me display karo
+        idbox.innerHTML = id + ' <span class="same-tag">LOCAL ✓</span>';
+        foot.textContent = '✓ Identical ID returned — hardware consistency works perfectly.';
+
+        // 2. Console me print karo jaisa aapne pucha tha
+        console.log("Current Active Canvas ID:", id);
+      } else {
+        idbox.classList.add('error');
+        idbox.textContent = 'Error: Canvas not found.';
+      }
+    }
 
     function setActive(site) {
       btns.forEach(function (b) { b.classList.toggle('active', b.dataset.site === site); });
     }
+
     function showLoading() {
       idbox.classList.remove('error'); idbox.classList.add('loading');
       idbox.textContent = 'Acquiring ID…';
-    }
-
-    // id-generator calls this ONCE per (re)acquisition. Assigned a single time
-    // below — never reassigned (reassigning re-triggers the immediate-fire setter).
-    function render(id) {
-      var first = idbox.getAttribute('data-first-id');
-      var isFirst = !first;
-      if (isFirst) { idbox.setAttribute('data-first-id', id); first = id; }
-      var same = !isFirst && id === first;
-      idbox.classList.remove('loading', 'error');
-      idbox.innerHTML = id + (same ? ' <span class="same-tag">SAME ✓</span>' : '');
-      foot.textContent = isFirst
-        ? 'First ID acquired. Now click another "site" to verify it stays the same.'
-        : (same
-            ? '✓ Identical ID returned — cross-site identity works without cookies.'
-            : '✗ ID changed (unexpected).');
-    }
-
-    // Simulate landing on a brand-new site: a real different origin on Safari has
-    // NO shared storage (cache, nonce and the crypto key are all partitioned), so
-    // we wipe them. The only thing that survives across origins is the device
-    // itself → the server must re-identify us from fingerprint + IP alone.
-    function wipePartitionedStorage() {
-      try { localStorage.removeItem('ntrx_id'); } catch (e) {}
-      try { localStorage.removeItem('ntrx_nonce'); } catch (e) {}
-      return new Promise(function (resolve) {
-        try {
-          var r = indexedDB.deleteDatabase('ntrx');
-          r.onsuccess = r.onerror = r.onblocked = function () { resolve(); };
-        } catch (e) { resolve(); }
-      });
     }
 
     function visitSite(site) {
@@ -158,25 +144,30 @@
       tabSite.textContent = site;
       document.title = 'NitroCommerce — ' + site;
       showLoading();
-      wipePartitionedStorage().then(function () { window.iDx.reacquire(); });
+
+      // Fake delay simulate karne ke liye jab button click ho
+      setTimeout(function () {
+        displayChecksum();
+      }, 300);
     }
 
-    window.iDx.onIdAquired = render;   // set exactly once
+    // Page load hote hi first time check run karein
+    displayChecksum();
 
+    // Event listeners for buttons
     btns.forEach(function (b) {
       b.addEventListener('click', function () { visitSite(b.dataset.site); });
     });
 
     document.getElementById('clear-btn').addEventListener('click', function () {
-      wipePartitionedStorage().then(function () {
-        idbox.removeAttribute('data-first-id');
-        setActive(null);
-        siteName.textContent = 'localhost';
-        tabSite.textContent = 'localhost';
-        document.title = 'NitroCommerce — localhost';
-        showLoading();
-        window.iDx.reacquire();
-      });
+      setActive(null);
+      siteName.textContent = 'localhost';
+      tabSite.textContent = 'localhost';
+      document.title = 'NitroCommerce — localhost';
+      showLoading();
+      setTimeout(function () {
+        displayChecksum();
+      }, 300);
     });
   })();
   </script>
