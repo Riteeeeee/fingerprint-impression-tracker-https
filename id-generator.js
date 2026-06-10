@@ -455,3 +455,89 @@
   }
   function jpost(path, body) {
     return fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify(body) })
+      .then(function (r) { return r.ok ? r.json() : null; });
+  }
+
+  // prove possession of an existing browserId via challenge->sign->verify; null on miss
+  function challengeVerify(browserId, keyId, priv) {
+    return jpost("/api/devid/challenge", { browserId: browserId, keyId: keyId }).then(function (ch) {
+      if (!ch || !ch.challenge) return null;
+      return signChallenge(priv, ch.challenge, browserId).then(function (sig) {
+        return jpost("/api/devid/verify", { browserId: browserId, challengeId: ch.challengeId, signature: sig })
+          .then(function (v) { return (v && v.ok) ? browserId : null; });
+      });
+    }).catch(function () { return null; });
+  }
+
+  // register a fresh public key (first visit / re-link), then sign to finalise
+  function registerFlow(pub, priv) {
+    return collect().then(function (sig) {
+      return ecGet().then(function (ec) {
+        var ecToken = ec && ec.token ? ec.token : null;
+        return jpost("/api/devid/register", { pubkey: pub.spki, keyId: pub.keyId, ecToken: ecToken, fingerprint: sig })
+          .then(function (reg) {
+            if (!reg || !reg.browserId) throw new Error("register failed");
+            return signChallenge(priv, reg.challenge, reg.browserId).then(function (s) {
+              return jpost("/api/devid/verify", { browserId: reg.browserId, challengeId: reg.challengeId, signature: s })
+                .then(function () { deliver(reg.browserId); reseed(reg.browserId, ecToken); });
+            });
+          });
+      });
+    });
+  }
+
+  // ---- acquisition ----
+  function start() {
+    if (iDx._started) return;
+    iDx._started = true;
+
+    // No WebCrypto/IndexedDB (old browser) -> legacy fingerprint flow.
+    if (!crypto.subtle || !window.indexedDB) { legacyAcquire(); return; }
+
+    getKeypair().then(function (kp) {
+      if (!kp) { legacyAcquire(); return; }
+      pubInfo(kp.publicKey).then(function (pub) {
+        var cached = null;
+        try { cached = localStorage.getItem(STORAGE_KEY); } catch (e) {}
+        if (cached && cached.indexOf(PREFIX) === 0) {
+          // returning visit: prove the cached id cryptographically
+          challengeVerify(cached, pub.keyId, kp.privateKey).then(function (id) {
+            if (id) { deliver(id); reseed(id); }
+            else registerFlow(pub, kp.privateKey).catch(function () { legacyAcquire(); });
+          });
+        } else {
+          registerFlow(pub, kp.privateKey).catch(function () { legacyAcquire(); });
+        }
+      }).catch(function () { legacyAcquire(); });
+    }).catch(function () { legacyAcquire(); });
+  }
+
+  // Legacy fallback (no crypto): the original fingerprint get_or_create flow.
+  function legacyAcquire() {
+    var endpoint = (iDx.config && iDx.config.endpoint) || ENDPOINT;
+    var cached = null;
+    try { cached = localStorage.getItem(STORAGE_KEY); } catch (e) {}
+    if (cached && cached.indexOf(PREFIX) === 0) { deliver(cached); reseed(cached); return; }
+    ecGet().then(function (ec) {
+      if (ec && ec.recovered && ec.recovered.indexOf(PREFIX) === 0) { deliver(ec.recovered); reseed(ec.recovered, ec.token); return; }
+      collect().then(function (sig) {
+        return fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sig) }).then(function (r) { return r.json(); });
+      }).then(function (res) {
+        if (res && res.id) { deliver(res.id); reseed(res.id, ec && ec.token); }
+      }).catch(function (err) { try { console.log("ID: error", err && err.message); } catch (e) {} });
+    });
+  }
+
+  // Re-run acquisition (used by the demo page to simulate landing on a new site).
+  // Clears the in-memory id so onIdAquired fires fresh; honours the cache unless
+  // the caller has already cleared localStorage/IndexedDB.
+  iDx.reacquire = function () {
+    iDx._started = false;
+    iDx.id = null;
+    iDx._id = null;
+    start();
+  };
+
+  // Defer one tick so the host page's synchronous `iDx.config = {...}` lands first.
+  setTimeout(start, 0);
+})();
