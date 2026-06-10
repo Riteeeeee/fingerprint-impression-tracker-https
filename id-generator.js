@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  var PREFIX = "ntrx_";
+  var PREFIX = "br_";
   var STORAGE_KEY = "ntrx_id";
   var w = window;
 
