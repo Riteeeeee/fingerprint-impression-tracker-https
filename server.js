@@ -18,7 +18,7 @@ const path = require("path");
 const PORT = process.env.PORT || 8080;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "data.json");
 const SCRIPT_FILE = path.join(__dirname, "id-generator.js");
-const PREFIX = "ntrx_";
+const PREFIX = "br_";   // browserId prefix (br_ + 64 hex = 67 chars, meets the 48-char rule)
 
 // Per-signal weights = entropy (how distinguishing) x stability (survives revisits).
 // Matching is CONFIDENCE based: confidence = matchedWeight / comparableWeight, so
@@ -65,6 +65,7 @@ const byEcToken = new Map();      // evercookie HTTP-cache token -> record
 // fused into one identity. We count them and keep a log of fuzzy merges to review.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const stats = { total: 0, keyId: 0, nonce: 0, exact: 0, fuzzy: 0, split: 0, fresh: 0 };
+let visits = 0;                   // global visit counter -> visitId in the response
 const fuzzyLog = [];              // recent fuzzy merges: {t, id, score, ip, keyId}
 function logFuzzy(e) { fuzzyLog.push(e); if (fuzzyLog.length > 300) fuzzyLog.shift(); }
 
@@ -72,6 +73,7 @@ function load() {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
     records = raw.records || [];
+    visits = raw.visits || 0;
     byCore.clear(); byNonce.clear(); byKey.clear(); byEcToken.clear();
     for (const r of records) {
       if (!r.nonces) r.nonces = [];
@@ -93,7 +95,7 @@ function save() {
     saveTimer = null;
     try {
       const tmp = DATA_FILE + ".tmp";
-      fs.writeFileSync(tmp, JSON.stringify({ records }));
+      fs.writeFileSync(tmp, JSON.stringify({ records, visits }));
       fs.renameSync(tmp, DATA_FILE); // atomic
     } catch (e) { console.error("[ntrx] save error", e); }
   }, 500);
@@ -136,6 +138,7 @@ function compare(a, b) {
 
 function touch(r, ip, sig, nonce, keyId) {
   r.lastSeen = Date.now();
+  r.hits = (r.hits || 0) + 1;
   if (ip && r.ips.indexOf(ip) === -1) r.ips.push(ip);
   if (nonce && r.nonces.indexOf(nonce) === -1) { r.nonces.push(nonce); byNonce.set(nonce, r); }
   if (keyId && r.keyIds.indexOf(keyId) === -1) { r.keyIds.push(keyId); byKey.set(keyId, r); }
@@ -149,6 +152,7 @@ function identify(sig, ip) {
   const incognito = sig.incognito === "1" || sig.incognito === true;
   const h = coreHash(sig);
   stats.total++;
+  let bestScore = 0;   // best fuzzy confidence seen (becomes matchScore on a new id)
 
   // 0) known crypto keyId — STRONGEST signal: cryptographic proof of the same
   //    physical device. Cannot collide between two identical units.
@@ -157,7 +161,7 @@ function identify(sig, ip) {
     if (r.hashes.indexOf(h) === -1) { r.hashes.push(h); byCore.set(h, r); }
     touch(r, ip, sig, nonce, keyId);
     stats.keyId++;
-    return r.id;
+    return { id: r.id, isNew: false, matchScore: 1, visitId: r.hits };
   }
 
   // 1) known nonce — same physical device on this origin (weaker than keyId).
@@ -166,7 +170,7 @@ function identify(sig, ip) {
     if (r.hashes.indexOf(h) === -1) { r.hashes.push(h); byCore.set(h, r); }
     touch(r, ip, sig, nonce, keyId);
     stats.nonce++;
-    return r.id;
+    return { id: r.id, isNew: false, matchScore: 1, visitId: r.hits };
   }
 
   // Identical-unit collision check: same fingerprint already bound to a
@@ -189,7 +193,7 @@ function identify(sig, ip) {
       touch(exact, ip, sig, nonce, keyId);
       stats.exact++;
       if (collisionRisk) logFuzzy({ t: Date.now(), id: exact.id, score: "exact-hash", ip: ip, keyId: keyId, keyIdsNow: exact.keyIds.length });
-      return exact.id;
+      return { id: exact.id, isNew: false, matchScore: 1, visitId: exact.hits };
     }
 
     // 3) fuzzy match over ALL identities by CONFIDENCE (matched / comparable weight).
@@ -201,16 +205,18 @@ function identify(sig, ip) {
       if (c.comparable < MIN_COMPARABLE) continue;
       if (c.confidence > bestCmp.confidence) { bestCmp = c; best = r; }
     }
+    bestScore = bestCmp.confidence;
     if (best) {
       const sameIp = best.ips.indexOf(ip) !== -1;
       const conf = bestCmp.confidence;
+      // matchScore > threshold -> SAME id from the store (this is the "return same id" rule)
       if ((sameIp && conf >= CONF_SAME_IP) || conf >= CONF_CROSS_IP) {
         best.hashes.push(h);
         byCore.set(h, best);
         touch(best, ip, sig, nonce, keyId);
         stats.fuzzy++;
         logFuzzy({ t: Date.now(), id: best.id, score: conf.toFixed(2) + (sameIp ? "" : " (cross-IP)"), ip: ip, keyId: keyId, keyIdsNow: best.keyIds.length });
-        return best.id;
+        return { id: best.id, isNew: false, matchScore: conf, visitId: best.hits };
       }
     }
   } else {
@@ -220,7 +226,7 @@ function identify(sig, ip) {
   // 4) new identity (also the unit-split path)
   const r = {
     id: newId(), hashes: [h], nonces: nonce ? [nonce] : [], keyIds: keyId ? [keyId] : [],
-    ecTokens: [], ips: ip ? [ip] : [], sig: sig, createdAt: Date.now(), lastSeen: Date.now()
+    ecTokens: [], ips: ip ? [ip] : [], sig: sig, hits: 1, createdAt: Date.now(), lastSeen: Date.now()
   };
   records.push(r);
   byCore.set(h, r);                 // newest unit wins the bare-fingerprint mapping
@@ -228,7 +234,7 @@ function identify(sig, ip) {
   if (keyId) byKey.set(keyId, r);
   save();
   stats.fresh++;
-  return r.id;
+  return { id: r.id, isNew: true, matchScore: bestScore, visitId: 1 };
 }
 
 // ---------- http ----------
@@ -322,7 +328,7 @@ const server = http.createServer((req, res) => {
     const q = (req.url.split("?")[1] || "").split("&").reduce((a, kv) => { const [k, v] = kv.split("="); a[k] = decodeURIComponent(v || ""); return a; }, {});
 
     // bind token -> id
-    if (q.bind && /^ntrx_[0-9a-f]+$/.test(q.id || "")) {
+    if (q.bind && /^(br|ntrx)_[0-9a-f]+$/.test(q.id || "")) {
       const rec = records.find(r => r.id === q.id);
       if (rec) {
         if (!rec.ecTokens) rec.ecTokens = [];
@@ -364,8 +370,16 @@ const server = http.createServer((req, res) => {
       if (ja4) sig.ja4 = String(ja4);
       const h2 = req.headers["x-h2fp"] || req.headers["x-http2-fingerprint"];
       if (h2) sig.h2fp = String(h2);
-      const id = identify(sig, clientIp(req));
-      res.writeHead(200); res.end(JSON.stringify({ id }));
+      const r = identify(sig, clientIp(req));
+      const vid = ++visits; save();
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        browserId: r.id,                              // the stable identity (>= 48 chars)
+        id: r.id,                                     // alias (client reads res.id)
+        isNew: r.isNew,                               // true = freshly created this visit
+        matchScore: Number((r.matchScore || 0).toFixed(4)),  // confidence of the match
+        visitId: vid                                  // global visit counter
+      }));
     });
     return;
   }
@@ -374,5 +388,5 @@ const server = http.createServer((req, res) => {
 });
 
 load();
-process.on("SIGINT", () => { try { fs.writeFileSync(DATA_FILE, JSON.stringify({ records })); } catch (e) {} process.exit(0); });
+process.on("SIGINT", () => { try { fs.writeFileSync(DATA_FILE, JSON.stringify({ records, visits })); } catch (e) {} process.exit(0); });
 server.listen(PORT, () => console.log("[ntrx] listening on :" + PORT));
