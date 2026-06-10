@@ -13,7 +13,8 @@ services:
     autoDeploy: true           # redeploy on every git push
     envVars:
       - key: UNIQUE_UNITS
-        value: "0"             # 0 = cross-site consistency (same ID survives cache clears)
+        value: "1"             # 1 = separate identical-model devices via per-device crypto keyId
+                               #     (still stable per-device: keyId survives cache clears)
       - key: NODE_VERSION
         value: "22"
 
