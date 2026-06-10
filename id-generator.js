@@ -15,6 +15,13 @@
  *      That call links the same device across DIFFERENT origins, because WebKit on
  *      one device yields a consistent fingerprint and the server sees one client IP.
  *   No cookies are used (first- or third-party), so ITP / 3p-cookie blocking is moot.
+ *
+ * Canvas strategy (Safari-stable):
+ *   Old approach: draw small text + shapes, hash toDataURL() — lossy, Safari-unstable.
+ *   New approach: draw on 800x400 canvas, read ALL pixel bytes via getImageData(),
+ *   run FNV-1a over the full pixel buffer. This is the same checksum that stays
+ *   identical across reloads on the same device/browser/OS, making it a far stronger
+ *   and more stable signal on Safari / WebKit.
  */
 (function () {
   "use strict";
@@ -73,10 +80,17 @@
     return ("0000000" + h.toString(16)).slice(-8);
   }
 
+  // ---- FNV-1a over raw Uint8Array (pixel buffer variant) ----
+  function fnv1aBytes(bytes) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < bytes.length; i++) {
+      h ^= bytes[i];
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return h >>> 0; // unsigned 32-bit integer
+  }
+
   // ---- per-origin random nonce: distinguishes two IDENTICAL devices.
-  // NOTE: localStorage is partitioned per top-level site on Safari, so this
-  // nonce is per-(device,origin). It can separate identical units, but cannot
-  // by itself link the same device across different sites. ----
   function getNonce() {
     try {
       var n = localStorage.getItem("ntrx_nonce");
@@ -91,15 +105,10 @@
     } catch (e) { return "na"; }
   }
 
-  // ---- media-query signal (WebKit-safe display capabilities) ----
+  // ---- media-query signal ----
   function mq(q) { try { return window.matchMedia(q).matches ? 1 : 0; } catch (e) { return "na"; } }
 
-  // ---- per-device cryptographic key: STRONGEST per-unit signal.
-  // A non-extractable ECDSA keypair lives in IndexedDB; the private key never
-  // leaves the browser, so the keyId (sha256 of the public key) is unique per
-  // physical device — even two identical models differ. Like the nonce it is
-  // per-origin (IndexedDB is partitioned on Safari), so it separates units but
-  // does not by itself link across sites. ----
+  // ---- per-device cryptographic key ----
   function pubId(pub) {
     return crypto.subtle.exportKey("spki", pub).then(function (raw) {
       return crypto.subtle.digest("SHA-256", raw).then(function (h) {
@@ -122,7 +131,6 @@
           g.onerror = function () { resolve("na"); };
           g.onsuccess = function () {
             if (g.result) return pubId(g.result.publicKey).then(resolve, function () { resolve("na"); });
-            // first visit on this origin: mint a fresh non-extractable keypair
             crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"])
               .then(function (kp) {
                 var tx = db.transaction("kv", "readwrite");
@@ -136,7 +144,7 @@
     });
   }
 
-  // ---- storage quota: varies with free disk space => weak per-unit signal ----
+  // ---- storage quota ----
   function storageQuota() {
     try {
       if (navigator.storage && navigator.storage.estimate) {
@@ -148,7 +156,7 @@
     return Promise.resolve("na");
   }
 
-  // ---- installed fonts (high entropy, stable; great on Safari where canvas is generic) ----
+  // ---- installed fonts ----
   function fontsFP() {
     try {
       var base = ["monospace", "sans-serif", "serif"];
@@ -176,7 +184,7 @@
     } catch (e) { return "na"; }
   }
 
-  // ---- extra WebGL parameters + extensions (GPU/driver profile) ----
+  // ---- WebGL parameters + extensions ----
   function webglParams() {
     try {
       var c = document.createElement("canvas");
@@ -193,7 +201,7 @@
     } catch (e) { return "na"; }
   }
 
-  // ---- installed speech-synthesis voices (very identifying on macOS/Safari) ----
+  // ---- speech synthesis voices ----
   function speechVoices() {
     return new Promise(function (resolve) {
       try {
@@ -208,21 +216,62 @@
     });
   }
 
-  // ---- fingerprint signals (all WebKit/Safari-safe) ----
+  // =========================================================================
+  // CANVAS FINGERPRINT — Safari-stable pixel-level checksum
+  // =========================================================================
+  // Replaces the old toDataURL()-based canvasFP().
+  //
+  // Why this is better for Safari / WebKit:
+  //   - toDataURL() goes through PNG encoding, which can vary slightly across
+  //     OS versions, GPU drivers, and color management profiles.
+  //   - Reading raw RGBA pixels with getImageData() captures the actual
+  //     rendered output bytes before any encoding step.
+  //   - On the same device / browser / OS the pixel bytes are deterministic,
+  //     so the FNV-1a checksum over all 800×400×4 = 1,280,000 bytes is
+  //     identical across every page reload — making it a stable signal.
+  //
+  // Scene: line + circle + large text — chosen to exercise the text rasteriser
+  // and anti-aliasing path, which differ across rendering engines.
+  // =========================================================================
   function canvasFP() {
     try {
       var c = document.createElement("canvas");
-      c.width = 280; c.height = 60;
+      c.width = 800; c.height = 400;
       var ctx = c.getContext("2d");
-      ctx.textBaseline = "top";
-      ctx.font = "14px 'Arial'";
-      ctx.fillStyle = "#f60"; ctx.fillRect(125, 1, 62, 20);
-      ctx.fillStyle = "#069"; ctx.fillText("ntrx\u25CE id-9876543210", 2, 15);
-      ctx.fillStyle = "rgba(102,204,0,0.7)"; ctx.fillText("ntrx\u25CE id-9876543210", 4, 17);
-      return fnv1a(c.toDataURL());
+
+      // White background
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, c.width, c.height);
+
+      // Diagonal line — exercises sub-pixel anti-aliasing
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#000000";
+      ctx.beginPath();
+      ctx.moveTo(100, 100);
+      ctx.lineTo(500, 200);
+      ctx.stroke();
+
+      // Circle — exercises arc rasterisation
+      ctx.beginPath();
+      ctx.arc(300, 150, 40, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Large text — exercises font rendering / hinting (biggest diff on WebKit)
+      ctx.font = "32px Arial";
+      ctx.fillStyle = "#000000";
+      ctx.fillText("CONSISTENCY_TEST", 100, 300);
+
+      // Read ALL pixel bytes
+      var pixels = ctx.getImageData(0, 0, c.width, c.height).data; // Uint8ClampedArray
+
+      // FNV-1a over the full pixel buffer → stable 32-bit unsigned int
+      var checksum = fnv1aBytes(pixels);
+
+      return String(checksum); // e.g. "2847193056"
     } catch (e) { return "na"; }
   }
 
+  // ---- WebGL renderer ----
   function webglFP() {
     try {
       var c = document.createElement("canvas");
@@ -235,6 +284,7 @@
     } catch (e) { return { v: "na", r: "na" }; }
   }
 
+  // ---- audio fingerprint ----
   function audioFP() {
     return new Promise(function (resolve) {
       try {
@@ -265,15 +315,408 @@
     });
   }
 
+  // ---- Battery API ----
+  function batteryFP() {
+    return new Promise(function (resolve) {
+      try {
+        if (!navigator.getBattery) return resolve("na");
+        navigator.getBattery().then(function (b) {
+          resolve([
+            b.charging ? 1 : 0,
+            Math.round(b.level * 100),
+            isFinite(b.chargingTime) ? Math.round(b.chargingTime / 60) : "inf",
+            isFinite(b.dischargingTime) ? Math.round(b.dischargingTime / 60) : "inf"
+          ].join(":"));
+        }).catch(function () { resolve("na"); });
+      } catch (e) { resolve("na"); }
+    });
+  }
+
+  // ---- Network Information API ----
+  function networkInfo() {
+    try {
+      var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+      if (!c) return "na";
+      return [
+        c.effectiveType || "na",
+        c.type || "na",
+        c.rtt !== undefined ? c.rtt : "na",
+        c.downlink !== undefined ? c.downlink : "na",
+        c.saveData ? 1 : 0
+      ].join("|");
+    } catch (e) { return "na"; }
+  }
+
+  // ---- Media codec support matrix ----
+  function codecsFP() {
+    try {
+      var v = document.createElement("video");
+      var a = document.createElement("audio");
+      function vc(t) { try { return v.canPlayType(t) || "na"; } catch (e) { return "na"; } }
+      function ac(t) { try { return a.canPlayType(t) || "na"; } catch (e) { return "na"; } }
+      var bits = [
+        vc('video/mp4; codecs="avc1.42E01E"'),
+        vc('video/mp4; codecs="avc1.640028"'),
+        vc('video/mp4; codecs="hev1.1.6.L93.B0"'),
+        vc('video/webm; codecs="vp8"'),
+        vc('video/webm; codecs="vp9"'),
+        vc('video/webm; codecs="vp09.00.10.08"'),
+        vc('video/webm; codecs="av01.0.08M.08"'),
+        vc('video/ogg; codecs="theora"'),
+        ac('audio/mp4; codecs="mp4a.40.2"'),
+        ac('audio/mp4; codecs="mp4a.40.5"'),
+        ac('audio/mp4; codecs="mp4a.69"'),
+        ac('audio/mpeg'),
+        ac('audio/ogg; codecs="vorbis"'),
+        ac('audio/ogg; codecs="opus"'),
+        ac('audio/wav; codecs="1"'),
+        ac('audio/flac'),
+        ac('audio/webm; codecs="opus"')
+      ].join(",");
+      return fnv1a(bits) + ":" + bits.length;
+    } catch (e) { return "na"; }
+  }
+
+  // ---- MediaCapabilities ----
+  function mediaCapsFP() {
+    return new Promise(function (resolve) {
+      try {
+        if (!navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return resolve("na");
+        var configs = [
+          { type: "file", video: { contentType: 'video/mp4; codecs="avc1.42E01E"', width: 1920, height: 1080, bitrate: 4000000, framerate: 30 } },
+          { type: "file", video: { contentType: 'video/webm; codecs="vp9"', width: 3840, height: 2160, bitrate: 20000000, framerate: 60 } },
+          { type: "file", video: { contentType: 'video/webm; codecs="av01.0.08M.08"', width: 1920, height: 1080, bitrate: 4000000, framerate: 30 } }
+        ];
+        Promise.all(configs.map(function (cfg) {
+          return navigator.mediaCapabilities.decodingInfo(cfg)
+            .then(function (r) { return [r.supported ? 1 : 0, r.smooth ? 1 : 0, r.powerEfficient ? 1 : 0].join(""); })
+            .catch(function () { return "na"; });
+        })).then(function (results) { resolve(results.join("|")); }).catch(function () { resolve("na"); });
+      } catch (e) { resolve("na"); }
+    });
+  }
+
+  // ---- CSS media query precision signals ----
+  function cssMQFP() {
+    try {
+      var dprExact = "na";
+      try {
+        var lo = 0.5, hi = 4.0, mid;
+        for (var i = 0; i < 7; i++) {
+          mid = Math.round((lo + hi) / 2 * 20) / 20;
+          if (window.matchMedia("(min-resolution: " + mid + "dppx)").matches) lo = mid;
+          else hi = mid;
+        }
+        dprExact = lo.toFixed(2);
+      } catch (e) {}
+
+      return [
+        dprExact,
+        mq("(pointer: fine)"),
+        mq("(pointer: coarse)"),
+        mq("(any-pointer: fine)"),
+        mq("(hover: hover)"),
+        mq("(any-hover: hover)"),
+        mq("(forced-colors: active)"),
+        mq("(inverted-colors: inverted)"),
+        mq("(prefers-contrast: more)"),
+        mq("(prefers-reduced-transparency: reduce)"),
+        mq("(update: fast)"),
+        mq("(update: slow)"),
+        mq("(overflow-block: scroll)"),
+        mq("(color-gamut: rec2020)"),
+        mq("(color-gamut: p3)"),
+        mq("(color-gamut: srgb)")
+      ].join(",");
+    } catch (e) { return "na"; }
+  }
+
+  // ---- Exact screen resolution via matchMedia ----
+  function screenMQFP() {
+    try {
+      function findVal(prop, lo, hi) {
+        for (var i = 0; i < 12; i++) {
+          var mid = Math.floor((lo + hi) / 2);
+          if (window.matchMedia("(" + prop + ": " + mid + "px)").matches) return mid;
+          if (window.matchMedia("(min-" + prop + ": " + mid + "px)").matches) lo = mid + 1;
+          else hi = mid - 1;
+        }
+        return lo;
+      }
+      return findVal("device-width", 200, 7680) + "x" + findVal("device-height", 200, 4320);
+    } catch (e) { return "na"; }
+  }
+
+  // ---- Gamepad ----
+  function gamepadFP() {
+    try {
+      if (!navigator.getGamepads) return "na";
+      var gps = navigator.getGamepads();
+      var connected = 0, haptic = 0;
+      for (var i = 0; i < gps.length; i++) {
+        if (gps[i]) {
+          connected++;
+          if (gps[i].hapticActuators && gps[i].hapticActuators.length) haptic++;
+        }
+      }
+      return connected + ":" + haptic;
+    } catch (e) { return "na"; }
+  }
+
+  // ---- MIDI ----
+  function midiFP() {
+    return new Promise(function (resolve) {
+      try {
+        if (!navigator.requestMIDIAccess) return resolve("na");
+        var done = false;
+        var timer = setTimeout(function () { if (!done) { done = true; resolve("na"); } }, 400);
+        navigator.requestMIDIAccess().then(function (m) {
+          if (done) return; done = true; clearTimeout(timer);
+          var inputs = [], outputs = [];
+          m.inputs.forEach(function (p) { inputs.push(p.manufacturer || "?"); });
+          m.outputs.forEach(function (p) { outputs.push(p.manufacturer || "?"); });
+          resolve(fnv1a(inputs.sort().join(",") + "|" + outputs.sort().join(",")) +
+            ":" + inputs.length + ":" + outputs.length);
+        }).catch(function () { if (!done) { done = true; clearTimeout(timer); resolve("denied"); } });
+      } catch (e) { resolve("na"); }
+    });
+  }
+
+  // ---- Permissions ----
+  function permissionsFP() {
+    return new Promise(function (resolve) {
+      try {
+        if (!navigator.permissions || !navigator.permissions.query) return resolve("na");
+        var names = ["camera", "microphone", "notifications", "geolocation",
+                     "accelerometer", "gyroscope", "magnetometer"];
+        Promise.all(names.map(function (name) {
+          return navigator.permissions.query({ name: name })
+            .then(function (r) { return r.state ? r.state[0] : "?"; })
+            .catch(function () { return "n"; });
+        })).then(function (states) { resolve(states.join("")); })
+          .catch(function () { resolve("na"); });
+      } catch (e) { resolve("na"); }
+    });
+  }
+
+  // ---- WebRTC local IP hash ----
+  function webrtcFP() {
+    return new Promise(function (resolve) {
+      try {
+        var RTC = window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
+        if (!RTC) return resolve("na");
+        var ips = [];
+        var done = false;
+        var timer = setTimeout(function () {
+          if (!done) { done = true; pc.close(); resolve(ips.length ? fnv1a(ips.sort().join(",")) : "na"); }
+        }, 600);
+        var pc = new RTC({ iceServers: [] });
+        pc.createDataChannel("");
+        pc.onicecandidate = function (e) {
+          if (!e || !e.candidate || !e.candidate.candidate) return;
+          var m = e.candidate.candidate.match(/(\d{1,3}\.){3}\d{1,3}|[0-9a-f]{1,4}(:[0-9a-f]{0,4}){2,7}/i);
+          if (m && ips.indexOf(m[0]) === -1) ips.push(m[0]);
+        };
+        pc.onicegatheringstatechange = function () {
+          if (pc.iceGatheringState === "complete" && !done) {
+            done = true; clearTimeout(timer); pc.close();
+            resolve(ips.length ? fnv1a(ips.sort().join(",")) : "na");
+          }
+        };
+        pc.createOffer().then(function (offer) { return pc.setLocalDescription(offer); }).catch(function () {
+          if (!done) { done = true; clearTimeout(timer); resolve("na"); }
+        });
+      } catch (e) { resolve("na"); }
+    });
+  }
+
+  // ---- Performance timing entropy ----
+  function perfTimingFP() {
+    try {
+      if (!window.performance || !performance.now) return "na";
+      var samples = [];
+      var t0 = performance.now();
+      for (var i = 0; i < 20; i++) {
+        var t = performance.now();
+        samples.push(Math.round((t - t0) * 1000));
+        t0 = t;
+      }
+      var navTiming = "na";
+      try {
+        var nt = performance.getEntriesByType("navigation")[0] ||
+                 (performance.timing ? {
+                   domainLookupEnd: performance.timing.domainLookupEnd,
+                   domainLookupStart: performance.timing.domainLookupStart,
+                   connectEnd: performance.timing.connectEnd,
+                   connectStart: performance.timing.connectStart,
+                   responseEnd: performance.timing.responseEnd,
+                   responseStart: performance.timing.responseStart
+                 } : null);
+        if (nt) {
+          navTiming = [
+            Math.round(nt.domainLookupEnd - nt.domainLookupStart),
+            Math.round(nt.connectEnd - nt.connectStart),
+            Math.round(nt.responseEnd - nt.responseStart)
+          ].join(":");
+        }
+      } catch (e) {}
+      return fnv1a(samples.join(",")) + "|" + navTiming;
+    } catch (e) { return "na"; }
+  }
+
+  // ---- WebGL2 shader precision ----
+  function webgl2FP() {
+    try {
+      var c = document.createElement("canvas");
+      var gl = c.getContext("webgl2");
+      if (!gl) return "na";
+      var prec = [];
+      var shaderTypes = [gl.VERTEX_SHADER, gl.FRAGMENT_SHADER];
+      var precTypes = [gl.LOW_FLOAT, gl.MEDIUM_FLOAT, gl.HIGH_FLOAT, gl.LOW_INT, gl.MEDIUM_INT, gl.HIGH_INT];
+      for (var si = 0; si < shaderTypes.length; si++) {
+        for (var pi = 0; pi < precTypes.length; pi++) {
+          try {
+            var f = gl.getShaderPrecisionFormat(shaderTypes[si], precTypes[pi]);
+            if (f) prec.push(f.rangeMin + "," + f.rangeMax + "," + f.precision);
+          } catch (e) { prec.push("e"); }
+        }
+      }
+      var aniso = "na";
+      try {
+        var extA = gl.getExtension("EXT_texture_filter_anisotropic") ||
+                   gl.getExtension("WEBKIT_EXT_texture_filter_anisotropic");
+        if (extA) aniso = gl.getParameter(extA.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+      } catch (e) {}
+      return fnv1a(prec.join("|")) + ":" + aniso;
+    } catch (e) { return "na"; }
+  }
+
+  // ---- CSS feature detection ----
+  function cssFeaturesFP() {
+    try {
+      if (!window.CSS || !CSS.supports) return "na";
+      var checks = [
+        "display:grid",
+        "display:subgrid",
+        "(display:masonry)",
+        "content-visibility:auto",
+        "contain:layout",
+        "container-type:inline-size",
+        "backdrop-filter:blur(1px)",
+        "-webkit-backdrop-filter:blur(1px)",
+        "color:oklch(50% 0.2 270)",
+        "color:color(display-p3 1 0 0)",
+        "font-variant-alternates:stylistic(a)",
+        "animation-timeline:scroll()",
+        "overscroll-behavior:contain",
+        "text-decoration-thickness:auto",
+        "accent-color:auto",
+        "(transform-style:preserve-3d) and (perspective:1px)"
+      ];
+      return checks.map(function (q) {
+        try { return CSS.supports(q) ? 1 : 0; } catch (e) { return 0; }
+      }).join("");
+    } catch (e) { return "na"; }
+  }
+
+  // ---- Math JIT fingerprint ----
+  function mathFP() {
+    try {
+      var v = [
+        Math.tan(-1e300), Math.sin(Math.PI),
+        Math.cos(1e300),  Math.atan(2),
+        Math.atan2(-0, -0), Math.exp(1),
+        Math.log(1 + 1e-10), Math.sinh(1),
+        Math.cosh(0.000001), Math.tanh(0.5)
+      ].map(function (x) { return isFinite(x) ? x.toFixed(15) : String(x); }).join(",");
+      return fnv1a(v);
+    } catch (e) { return "na"; }
+  }
+
+  // ---- Intl / locale depth ----
+  function intlFP() {
+    try {
+      var results = [];
+      try { results.push(Intl.supportedValuesOf("calendar").length); } catch (e) { results.push("na"); }
+      try { results.push(Intl.supportedValuesOf("currency").length); } catch (e) { results.push("na"); }
+      try { results.push(new Intl.NumberFormat().format(1000000)); } catch (e) { results.push("na"); }
+      try {
+        var hour = new Intl.DateTimeFormat([], { hour: "numeric" }).format(new Date(2000, 0, 1, 13));
+        results.push(/pm|am/i.test(hour) ? "12h" : "24h");
+      } catch (e) { results.push("na"); }
+      try {
+        var col = new Intl.Collator();
+        results.push(col.compare("a", "b") < 0 ? 1 : 0);
+      } catch (e) { results.push("na"); }
+      return fnv1a(results.join("|"));
+    } catch (e) { return "na"; }
+  }
+
+  // ---- Hardware sensors ----
+  function sensorsFP() {
+    return new Promise(function (resolve) {
+      try {
+        var detected = [];
+        var checks = [
+          ["Accelerometer", "acc"],
+          ["Gyroscope", "gyro"],
+          ["LinearAccelerationSensor", "lin"],
+          ["AbsoluteOrientationSensor", "abs"],
+          ["RelativeOrientationSensor", "rel"],
+          ["AmbientLightSensor", "als"],
+          ["Magnetometer", "mag"]
+        ];
+        var pending = checks.length;
+        checks.forEach(function (pair) {
+          try {
+            if (!(pair[0] in window)) { pending--; if (!pending) done(); return; }
+            var s = new window[pair[0]]({ frequency: 1 });
+            s.onerror = function () { pending--; if (!pending) done(); };
+            s.onreading = function () { detected.push(pair[1]); s.stop(); pending--; if (!pending) done(); };
+            s.start();
+            setTimeout(function () { try { s.stop(); } catch (e) {} }, 200);
+          } catch (e) {
+            if (e.name === "NotAllowedError") detected.push(pair[1] + "?");
+            pending--; if (!pending) done();
+          }
+        });
+        var timer = setTimeout(function () { resolve(detected.sort().join(",") || "none"); }, 500);
+        function done() { clearTimeout(timer); resolve(detected.sort().join(",") || "none"); }
+      } catch (e) { resolve("na"); }
+    });
+  }
+
+  // ---- collect all signals ----
   function collect() {
     var wg = webglFP();
-    return Promise.all([audioFP(), storageQuota(), getKeyId(), speechVoices()]).then(function (arr) {
-      var audio = arr[0], quota = arr[1], keyId = arr[2], voices = arr[3];
+    return Promise.all([
+      audioFP(),
+      storageQuota(),
+      getKeyId(),
+      speechVoices(),
+      batteryFP(),
+      mediaCapsFP(),
+      midiFP(),
+      permissionsFP(),
+      webrtcFP(),
+      sensorsFP()
+    ]).then(function (arr) {
+      var audio = arr[0], quota = arr[1], keyId = arr[2], voices = arr[3],
+          battery = arr[4], mediaCaps = arr[5], midi = arr[6],
+          perms = arr[7], rtcIP = arr[8], sensors = arr[9];
+
       var io = {};
       try { io = Intl.DateTimeFormat().resolvedOptions(); } catch (e) {}
+
       return {
-        // --- stable, cross-site fingerprint signals (model + browser engine) ---
+        // ---------------------------------------------------------------
+        // Canvas: pixel-level FNV-1a checksum (Safari-stable)
+        // Replaces old toDataURL()-based hash. Same device/browser/OS
+        // always yields the same 32-bit unsigned integer string.
+        // ---------------------------------------------------------------
         canvas: canvasFP(),
+
+        // --- other stable, cross-site fingerprint signals ---
         audio: audio,
         fonts: fontsFP(),
         voices: voices,
@@ -297,16 +740,51 @@
         colorDepth: screen.colorDepth || "na",
         dnt: navigator.doNotTrack || window.doNotTrack || "na",
         cookieEnabled: (typeof navigator.cookieEnabled === "boolean") ? String(navigator.cookieEnabled) : "na",
-        // display capabilities (good WebKit signals)
         dark: mq("(prefers-color-scheme: dark)"),
         motion: mq("(prefers-reduced-motion: reduce)"),
         gamut: mq("(color-gamut: p3)"),
         hdr: mq("(dynamic-range: high)"),
-        // --- per-unit signals (separate two identical devices) ---
+
+        // --- per-unit signals ---
         keyId: keyId,
         quota: quota,
         nonce: getNonce(),
-        ua: navigator.userAgent || ""
+        ua: navigator.userAgent || "",
+
+        // --- hardware ---
+        battery: battery,
+        gamepads: gamepadFP(),
+        midi: midi,
+        sensors: sensors,
+        webgl2: webgl2FP(),
+
+        // --- network / HTTP-adjacent ---
+        netInfo: networkInfo(),
+        rtcIP: rtcIP,
+        onLine: navigator.onLine ? 1 : 0,
+
+        // --- codec & media capabilities ---
+        codecs: codecsFP(),
+        mediaCaps: mediaCaps,
+
+        // --- CSS / display precision ---
+        cssMQ: cssMQFP(),
+        screenMQ: screenMQFP(),
+
+        // --- performance / timing ---
+        perfTiming: perfTimingFP(),
+
+        // --- JS engine math fingerprint ---
+        mathFP: mathFP(),
+
+        // --- permissions state ---
+        perms: perms,
+
+        // --- locale / Intl depth ---
+        intlFP: intlFP(),
+
+        // --- CSS feature support bitfield ---
+        cssFeatures: cssFeaturesFP()
       };
     });
   }
@@ -339,8 +817,6 @@
   }
 
   // Re-run acquisition (used by the demo page to simulate landing on a new site).
-  // Clears the in-memory id so onIdAquired fires fresh; honours the cache unless
-  // the caller has already cleared localStorage/IndexedDB.
   iDx.reacquire = function () {
     iDx._started = false;
     iDx.id = null;
@@ -348,6 +824,5 @@
     start();
   };
 
-  // Defer one tick so the host page's synchronous `iDx.config = {...}` lands first.
   setTimeout(start, 0);
 })();
