@@ -405,53 +405,53 @@
     else ecGet().then(function (ec) { if (ec && ec.token) ecBind(ec.token, id); });
   }
 
-  // ---- acquisition ----
-  function start() {
-    if (iDx._started) return;
-    iDx._started = true;
+  // ---- TIER 0: cryptographic device key (challenge-response) ----
+  var BASE = ENDPOINT.replace(/\/id$/, "");
 
-    var endpoint = (iDx.config && iDx.config.endpoint) || ENDPOINT;
+  function abToB64url(ab) { var b = new Uint8Array(ab), s = ""; for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+  function b64urlToU8(str) { str = String(str).replace(/-/g, "+").replace(/_/g, "/"); while (str.length % 4) str += "="; var bin = atob(str), u = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
 
-    // 1) first-party localStorage cache — instant, then re-seed in background.
-    var cached = null;
-    try { cached = localStorage.getItem(STORAGE_KEY); } catch (e) {}
-    if (cached && cached.indexOf(PREFIX) === 0) { deliver(cached); reseed(cached); return; }
-
-    // 2) cache miss -> try evercookie recovery (survives a localStorage clear)
-    ecGet().then(function (ec) {
-      if (ec && ec.recovered && ec.recovered.indexOf(PREFIX) === 0) {
-        deliver(ec.recovered);
-        reseed(ec.recovered, ec.token);
-        return;
-      }
-      // 3) full fingerprint -> server get_or_create
-      collect().then(function (sig) {
-        return fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(sig)
-        }).then(function (r) { return r.json(); });
-      }).then(function (res) {
-        if (res && res.id) {
-          deliver(res.id);
-          reseed(res.id, ec && ec.token);
-        }
-      }).catch(function (err) {
-        try { console.log("ID: error", err && err.message); } catch (e) {}
+  // Load the device's non-extractable ECDSA P-256 keypair from IndexedDB, or mint one.
+  function getKeypair() {
+    return new Promise(function (resolve) {
+      try {
+        if (!window.indexedDB || !crypto.subtle) return resolve(null);
+        var req = indexedDB.open("ntrx", 1);
+        req.onupgradeneeded = function () { req.result.createObjectStore("kv"); };
+        req.onerror = function () { resolve(null); };
+        req.onsuccess = function () {
+          var db = req.result;
+          var g = db.transaction("kv", "readonly").objectStore("kv").get("kp");
+          g.onerror = function () { resolve(null); };
+          g.onsuccess = function () {
+            if (g.result && g.result.privateKey) return resolve(g.result);
+            crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"])
+              .then(function (kp) {
+                var tx = db.transaction("kv", "readwrite");
+                tx.objectStore("kv").put(kp, "kp");
+                tx.oncomplete = function () { resolve(kp); };
+                tx.onerror = function () { resolve(kp); };
+              }, function () { resolve(null); });
+          };
+        };
+      } catch (e) { resolve(null); }
+    });
+  }
+  // { spki, keyId } from the public key (keyId = b64url(sha256(SPKI)))
+  function pubInfo(pub) {
+    return crypto.subtle.exportKey("spki", pub).then(function (spki) {
+      return crypto.subtle.digest("SHA-256", spki).then(function (h) {
+        return { spki: abToB64url(spki), keyId: abToB64url(h) };
       });
     });
   }
-
-  // Re-run acquisition (used by the demo page to simulate landing on a new site).
-  // Clears the in-memory id so onIdAquired fires fresh; honours the cache unless
-  // the caller has already cleared localStorage/IndexedDB.
-  iDx.reacquire = function () {
-    iDx._started = false;
-    iDx.id = null;
-    iDx._id = null;
-    start();
-  };
-
-  // Defer one tick so the host page's synchronous `iDx.config = {...}` lands first.
-  setTimeout(start, 0);
-})();
+  // sign nonce||browserId with the non-extractable private key -> b64url(64B P1363)
+  function signChallenge(priv, challengeB64, browserId) {
+    var nonce = b64urlToU8(challengeB64);
+    var bid = new TextEncoder().encode(browserId);
+    var msg = new Uint8Array(nonce.length + bid.length);
+    msg.set(nonce, 0); msg.set(bid, nonce.length);
+    return crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, priv, msg).then(function (sig) { return abToB64url(sig); });
+  }
+  function jpost(path, body) {
+    return fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify(body) })
