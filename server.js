@@ -243,11 +243,12 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "OPTIONS") { cors(res, origin); res.writeHead(204); return res.end(); }
 
-  if (req.method === "GET" && (url === "/id-generator.js")) {
+  if (req.method === "GET" && (url === "/id-generator.js" || url === "/shopify-ntrx.js")) {
+    const jsFile = url === "/shopify-ntrx.js" ? path.join(__dirname, "shopify-ntrx.js") : SCRIPT_FILE;
     cors(res, origin);
     res.setHeader("Content-Type", "text/javascript; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=300");
-    return fs.readFile(SCRIPT_FILE, (e, buf) => {
+    return fs.readFile(jsFile, (e, buf) => {
       if (e) { res.writeHead(500); return res.end("// script unavailable"); }
       res.writeHead(200); res.end(buf);
     });
