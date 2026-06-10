@@ -148,6 +148,66 @@
     return Promise.resolve("na");
   }
 
+  // ---- installed fonts (high entropy, stable; great on Safari where canvas is generic) ----
+  function fontsFP() {
+    try {
+      var base = ["monospace", "sans-serif", "serif"];
+      var probe = ["Arial","Courier New","Georgia","Helvetica","Times New Roman","Verdana",
+        "Comic Sans MS","Impact","Trebuchet MS","Palatino","Tahoma","Monaco","Menlo","Geneva",
+        "Optima","Futura","Gill Sans","Baskerville","Andale Mono","Brush Script MT","Copperplate","Didot"];
+      var host = document.body || document.documentElement;
+      var span = document.createElement("span");
+      span.style.cssText = "position:absolute;left:-9999px;top:-9999px;font-size:72px";
+      span.textContent = "mmmmmmmmmmlli";
+      host.appendChild(span);
+      var def = {};
+      base.forEach(function (b) { span.style.fontFamily = b; def[b] = { w: span.offsetWidth, h: span.offsetHeight }; });
+      var found = [];
+      probe.forEach(function (f) {
+        var hit = false;
+        base.forEach(function (b) {
+          span.style.fontFamily = "'" + f + "'," + b;
+          if (span.offsetWidth !== def[b].w || span.offsetHeight !== def[b].h) hit = true;
+        });
+        if (hit) found.push(f);
+      });
+      host.removeChild(span);
+      return found.length ? found.join(",") : "na";
+    } catch (e) { return "na"; }
+  }
+
+  // ---- extra WebGL parameters + extensions (GPU/driver profile) ----
+  function webglParams() {
+    try {
+      var c = document.createElement("canvas");
+      var gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+      if (!gl) return "na";
+      var p = [
+        gl.getParameter(gl.MAX_TEXTURE_SIZE), gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS),
+        gl.getParameter(gl.MAX_VERTEX_ATTRIBS), gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS),
+        gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS), gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
+        gl.getParameter(gl.MAX_VIEWPORT_DIMS)
+      ].join("|");
+      var ext = (gl.getSupportedExtensions() || []).sort().join(",");
+      return fnv1a(p + "||" + ext);
+    } catch (e) { return "na"; }
+  }
+
+  // ---- installed speech-synthesis voices (very identifying on macOS/Safari) ----
+  function speechVoices() {
+    return new Promise(function (resolve) {
+      try {
+        if (!window.speechSynthesis) return resolve("na");
+        var done = false;
+        function names() { var v = speechSynthesis.getVoices() || []; return v.map(function (x) { return x.name; }).sort().join(","); }
+        function tryRead() { if (done) return; var s = names(); if (s) { done = true; resolve(fnv1a(s) + ":" + (speechSynthesis.getVoices() || []).length); } }
+        tryRead();
+        speechSynthesis.onvoiceschanged = tryRead;
+        setTimeout(function () { if (!done) { done = true; var s = names(); resolve(s ? fnv1a(s) + ":" + (speechSynthesis.getVoices() || []).length : "na"); } }, 600);
+      } catch (e) { resolve("na"); }
+    });
+  }
+
   // ---- fingerprint signals (all WebKit/Safari-safe) ----
   function canvasFP() {
     try {
@@ -207,17 +267,20 @@
 
   function collect() {
     var wg = webglFP();
-    return Promise.all([audioFP(), storageQuota(), getKeyId()]).then(function (arr) {
-      var audio = arr[0], quota = arr[1], keyId = arr[2];
+    return Promise.all([audioFP(), storageQuota(), getKeyId(), speechVoices()]).then(function (arr) {
+      var audio = arr[0], quota = arr[1], keyId = arr[2], voices = arr[3];
       var io = {};
       try { io = Intl.DateTimeFormat().resolvedOptions(); } catch (e) {}
       return {
         // --- stable, cross-site fingerprint signals (model + browser engine) ---
         canvas: canvasFP(),
         audio: audio,
+        fonts: fontsFP(),
+        voices: voices,
         webglV: wg.v,
         webglR: wg.r,
-        screen: [screen.width, screen.height, screen.colorDepth, window.devicePixelRatio || 1].join("x"),
+        webglP: webglParams(),
+        screen: [screen.width, screen.height, screen.colorDepth].join("x"),
         avail: [screen.availWidth, screen.availHeight].join("x"),
         dpr: window.devicePixelRatio || 1,
         orient: (screen.orientation && screen.orientation.type) || "na",
@@ -230,6 +293,10 @@
         langs: (navigator.languages || [navigator.language || ""]).join(","),
         vendor: navigator.vendor || "na",
         productSub: navigator.productSub || "na",
+        deviceMemory: navigator.deviceMemory || "na",
+        colorDepth: screen.colorDepth || "na",
+        dnt: navigator.doNotTrack || window.doNotTrack || "na",
+        cookieEnabled: (typeof navigator.cookieEnabled === "boolean") ? String(navigator.cookieEnabled) : "na",
         // display capabilities (good WebKit signals)
         dark: mq("(prefers-color-scheme: dark)"),
         motion: mq("(prefers-reduced-motion: reduce)"),
