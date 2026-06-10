@@ -68,6 +68,38 @@ const stats = { total: 0, keyId: 0, nonce: 0, exact: 0, fuzzy: 0, split: 0, fres
 let visits = 0;                   // global visit counter -> visitId in the response
 const fuzzyLog = [];              // recent fuzzy merges: {t, id, score, ip, keyId}
 function logFuzzy(e) { fuzzyLog.push(e); if (fuzzyLog.length > 300) fuzzyLog.shift(); }
+stats.register = 0; stats.verifyOk = 0; stats.verifyFail = 0; stats.relink = 0;
+
+// ---------- cryptographic device key (challenge-response) ----------
+// TIER 0: the device holds a NON-EXTRACTABLE ECDSA P-256 private key (IndexedDB).
+// The server stores its public key (SPKI) and, every visit, sends a random nonce
+// the client must SIGN. A valid signature over a FRESH nonce is unforgeable proof
+// of the same physical device — ~2^-128 collision, can't be copied or replayed.
+const byDevKey = new Map();       // crypto keyId (b64url sha256(SPKI)) -> record
+const ledger = new Map();         // challengeId -> { browserId, keyId, nonce, exp, used }
+function b64url(buf) { return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+function unb64url(s) { return Buffer.from(String(s).replace(/-/g, "+").replace(/_/g, "/"), "base64"); }
+function originHash(req) { return crypto.createHash("sha256").update(String(req.headers.origin || "")).digest(); }
+function newChallenge(browserId, keyId) {
+  const challengeId = crypto.randomBytes(16).toString("hex");
+  const nonce = crypto.randomBytes(32);
+  const exp = Date.now() + 60000;
+  ledger.set(challengeId, { browserId, keyId, nonce, exp, used: false });
+  return { challengeId, challenge: b64url(nonce), exp };
+}
+function verifySig(spkiDer, msg, sigBuf) {
+  try {
+    const key = crypto.createPublicKey({ key: spkiDer, format: "der", type: "spki" });
+    return crypto.verify("sha256", msg, { key, dsaEncoding: "ieee-p1363" }, sigBuf);
+  } catch (e) { return false; }
+}
+// burn expired/used challenges so the ledger can't grow unbounded
+setInterval(() => { const now = Date.now(); for (const [k, v] of ledger) if (v.used || now > v.exp) ledger.delete(k); }, 30000).unref();
+
+function readJson(req, cb) {
+  let b = ""; req.on("data", (c) => { b += c; if (b.length > 2e5) req.destroy(); });
+  req.on("end", () => { let j = {}; try { j = JSON.parse(b || "{}"); } catch (e) {} cb(j); });
+}
 
 function load() {
   try {
@@ -79,10 +111,12 @@ function load() {
       if (!r.nonces) r.nonces = [];
       if (!r.keyIds) r.keyIds = [];
       if (!r.ecTokens) r.ecTokens = [];
+      if (!r.keys) r.keys = [];
       for (const h of r.hashes) byCore.set(h, r);
       for (const n of r.nonces) byNonce.set(n, r);
       for (const k of r.keyIds) byKey.set(k, r);
       for (const t of r.ecTokens) byEcToken.set(t, r);
+      for (const k of r.keys) byDevKey.set(k.keyId, r);
     }
     console.log("[ntrx] loaded " + records.length + " identities");
   } catch (e) { records = []; }
@@ -237,6 +271,45 @@ function identify(sig, ip) {
   return { id: r.id, isNew: true, matchScore: bestScore, visitId: 1 };
 }
 
+// Resolve which identity a NEW device-key should attach to (register / re-link).
+// Prefers SECRET hints (evercookie token, legacy nonce) — NOT the public browserId,
+// which is broadcast and would be an identity-takeover primitive. Falls back to the
+// probabilistic fingerprint matcher (the ~1% zone) only when no secret hint survives.
+function resolveForRegister(fp, ip, ecToken, nonce) {
+  // 1) secret survivors -> deterministic re-link
+  if (ecToken && byEcToken.has(ecToken)) return { rec: byEcToken.get(ecToken), isNew: false, matchScore: 1 };
+  if (nonce && byNonce.has(nonce)) return { rec: byNonce.get(nonce), isNew: false, matchScore: 1 };
+  // A fresh key landing on a record that STILL has a live (active) key on the same
+  // IP is almost certainly a DIFFERENT physical unit (the real owner still holds its
+  // key) — under UNIQUE_UNITS we split it into its own identity to avoid a collision,
+  // rather than fuzzy-merging two devices. Re-link only records whose device has lost
+  // its key (no active key), or via a SECRET hint above.
+  const hasActiveKey = (r) => r.keys && r.keys.some((k) => k.status === "active");
+  // 2) exact fingerprint hash
+  const h = coreHash(fp);
+  const exact = byCore.get(h);
+  if (exact && !(UNIQUE_UNITS && hasActiveKey(exact) && exact.ips.indexOf(ip) !== -1)) {
+    return { rec: exact, isNew: false, matchScore: 1 };
+  }
+  // 3) fuzzy confidence re-link
+  let best = null, bestCmp = { confidence: 0, comparable: 0 };
+  for (const r of records) {
+    const c = compare(fp, r.sig);
+    if (c.comparable < MIN_COMPARABLE) continue;
+    if (c.confidence > bestCmp.confidence) { bestCmp = c; best = r; }
+  }
+  if (best) {
+    const sameIp = best.ips.indexOf(ip) !== -1;
+    const conf = bestCmp.confidence;
+    const passes = (sameIp && conf >= CONF_SAME_IP) || conf >= CONF_CROSS_IP;
+    if (passes && !(UNIQUE_UNITS && hasActiveKey(best) && sameIp)) {
+      best.relinkCount = (best.relinkCount || 0) + 1; stats.relink++;
+      return { rec: best, isNew: false, matchScore: conf };
+    }
+  }
+  return { rec: null, isNew: true, matchScore: 0 };
+}
+
 // ---------- http ----------
 function clientIp(req) {
   const xff = req.headers["x-forwarded-for"];
@@ -347,6 +420,76 @@ const server = http.createServer((req, res) => {
     if (!token) token = crypto.randomBytes(16).toString("hex");
     res.setHeader("ETag", '"ec:' + token + '"');
     res.writeHead(200); return res.end(JSON.stringify({ token: token, recovered: recovered }));
+  }
+
+  // ---- TIER 0: cryptographic device-key challenge-response ----
+  // register a fresh public key (first visit / re-link after wipe)
+  if (req.method === "POST" && url === "/api/devid/register") {
+    return readJson(req, (body) => {
+      cors(res, origin); res.setHeader("Content-Type", "application/json");
+      const pubkey = body.pubkey, keyId = body.keyId, fp = body.fingerprint || {};
+      if (!pubkey || !keyId) { res.writeHead(400); return res.end(JSON.stringify({ error: "missing key" })); }
+      const ip = clientIp(req);
+      const ecTok = (body.ecToken && body.ecToken !== "na") ? body.ecToken : null;
+      const nz = (fp.nonce && fp.nonce !== "na") ? fp.nonce : null;
+      let rec, isNew, matchScore;
+      if (byDevKey.has(keyId)) {
+        // this exact public key is already registered -> recover its identity
+        // deterministically (the keypair in IndexedDB IS the device anchor).
+        rec = byDevKey.get(keyId); isNew = false; matchScore = 1;
+      } else {
+        ({ rec, isNew, matchScore } = resolveForRegister(fp, ip, ecTok, nz));
+      }
+      if (!rec) {
+        rec = { id: newId(), keys: [], hashes: [], nonces: nz ? [nz] : [], keyIds: [], ecTokens: [],
+                ips: ip ? [ip] : [], sig: fp, hits: 0, createdAt: Date.now(), lastSeen: Date.now(), relinkCount: 0 };
+        records.push(rec);
+        if (nz) byNonce.set(nz, rec);
+      }
+      if (!rec.keys) rec.keys = [];
+      const kv = rec.keys.reduce((m, k) => Math.max(m, k.keyVersion), 0) + 1;
+      rec.keys.push({ keyVersion: kv, keyId, spki: pubkey, status: "pending", createdAt: Date.now(), verifyCount: 0 });
+      if (rec.keyIds.indexOf(keyId) === -1) rec.keyIds.push(keyId);
+      byDevKey.set(keyId, rec);
+      const h = coreHash(fp); if (rec.hashes.indexOf(h) === -1) { rec.hashes.push(h); byCore.set(h, rec); }
+      if (ecTok && rec.ecTokens.indexOf(ecTok) === -1) { rec.ecTokens.push(ecTok); byEcToken.set(ecTok, rec); }
+      rec.sig = fp; stats.register++; save();
+      const ch = newChallenge(rec.id, keyId);
+      res.writeHead(201);
+      res.end(JSON.stringify({ browserId: rec.id, keyVersion: kv, isNew, matchScore: Number(matchScore.toFixed(4)),
+        challengeId: ch.challengeId, challenge: ch.challenge, exp: ch.exp }));
+    });
+  }
+
+  // issue a fresh nonce for a known browserId+keyId (repeat visit)
+  if (req.method === "POST" && url === "/api/devid/challenge") {
+    return readJson(req, (body) => {
+      cors(res, origin); res.setHeader("Content-Type", "application/json");
+      const rec = byDevKey.get(body.keyId);
+      if (!rec || rec.id !== body.browserId) { res.writeHead(404); return res.end(JSON.stringify({ error: "unknown" })); }
+      res.writeHead(200); res.end(JSON.stringify(newChallenge(body.browserId, body.keyId)));
+    });
+  }
+
+  // verify the signature -> cryptographic proof of the same device
+  if (req.method === "POST" && url === "/api/devid/verify") {
+    return readJson(req, (body) => {
+      cors(res, origin); res.setHeader("Content-Type", "application/json");
+      const { browserId, challengeId, signature } = body;
+      const chal = ledger.get(challengeId);
+      if (!chal || chal.used || chal.browserId !== browserId || Date.now() > chal.exp) { stats.verifyFail++; res.writeHead(401); return res.end(JSON.stringify({ ok: false })); }
+      chal.used = true;   // burn first (success or fail) -> no replay
+      const rec = byDevKey.get(chal.keyId);
+      const keyEntry = rec && rec.keys && rec.keys.find((k) => k.keyId === chal.keyId);
+      if (!rec || rec.id !== browserId || !keyEntry) { stats.verifyFail++; res.writeHead(401); return res.end(JSON.stringify({ ok: false })); }
+      const msg = Buffer.concat([chal.nonce, Buffer.from(browserId)]);
+      if (!verifySig(unb64url(keyEntry.spki), msg, unb64url(signature))) { stats.verifyFail++; res.writeHead(401); return res.end(JSON.stringify({ ok: false })); }
+      keyEntry.status = "active"; keyEntry.lastVerifiedAt = Date.now(); keyEntry.verifyCount = (keyEntry.verifyCount || 0) + 1;
+      touch(rec, clientIp(req), rec.sig, null, null);
+      stats.verifyOk++; const vid = ++visits; save();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, browserId, id: browserId, isNew: false, matchScore: 1, visitId: vid }));
+    });
   }
 
   if (req.method === "GET" && url === "/health") {
