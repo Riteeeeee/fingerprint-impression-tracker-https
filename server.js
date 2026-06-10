@@ -30,12 +30,15 @@ const PREFIX = "ntrx_";
 //   medium                                 screen, ua, tz, locale
 //   low / high-collision                   the rest (weight 1)
 // keyId / nonce are NOT here: they are handled as exact tiers (0/1) in identify().
+// NOTE: deviceMemory dropped — Safari never implements it (always "na"), so it was
+// dead weight on the must-run platform. colorDepth/dnt/cookieEnabled kept at low
+// weight (near-constant). mathFP/apiMatrix/engineFP are engine+OS cohort + tamper bits.
 const WEIGHTS = {
   ja4: 8, h2fp: 5,
-  voices: 5, fonts: 4, canvas: 3, webglR: 2, webglP: 2, screen: 2, ua: 2,
-  tz: 1, locale: 1, audio: 1, avail: 1, dpr: 1, orient: 1,
+  voices: 5, fonts: 4, canvas: 3, webglR: 2, webglP: 2, screen: 2, ua: 2, mathFP: 2, apiMatrix: 2,
+  tz: 1, locale: 1, audio: 1, avail: 1, dpr: 1, orient: 1, engineFP: 1,
   platform: 1, cores: 1, touch: 1, vendor: 1, productSub: 1,
-  gamut: 1, hdr: 1, deviceMemory: 1, colorDepth: 1, dnt: 1, cookieEnabled: 1
+  gamut: 1, hdr: 1, colorDepth: 1, dnt: 1, cookieEnabled: 1
 };
 // Confidence thresholds for the fuzzy tier:
 const CONF_SAME_IP   = 0.55;   // same network: looser (absorbs drift)
@@ -54,6 +57,7 @@ let records = [];                 // [{ id, hashes:[], nonces:[], ips:[], sig:{}
 const byCore = new Map();         // coreHash -> record
 const byNonce = new Map();        // per-origin nonce -> record
 const byKey = new Map();          // per-device crypto keyId -> record
+const byEcToken = new Map();      // evercookie HTTP-cache token -> record
 
 // ---------- collision / match telemetry ----------
 // How each /id request was resolved. Fuzzy + (in UNIQUE_UNITS=0) bare exact-hash
@@ -68,13 +72,15 @@ function load() {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
     records = raw.records || [];
-    byCore.clear(); byNonce.clear(); byKey.clear();
+    byCore.clear(); byNonce.clear(); byKey.clear(); byEcToken.clear();
     for (const r of records) {
       if (!r.nonces) r.nonces = [];
       if (!r.keyIds) r.keyIds = [];
+      if (!r.ecTokens) r.ecTokens = [];
       for (const h of r.hashes) byCore.set(h, r);
       for (const n of r.nonces) byNonce.set(n, r);
       for (const k of r.keyIds) byKey.set(k, r);
+      for (const t of r.ecTokens) byEcToken.set(t, r);
     }
     console.log("[ntrx] loaded " + records.length + " identities");
   } catch (e) { records = []; }
@@ -105,7 +111,7 @@ function coreHash(s) {
   // canvas + WebGL + screen + nav fields survive a full cookie/site-data clear,
   // so the SAME device re-resolves to the SAME id. (audio still helps in fuzzy.)
   const basis = [
-    s.canvas, s.fonts, s.voices, s.webglV, s.webglR, s.webglP, s.screen,
+    s.canvas, s.fonts, s.voices, s.webglV, s.webglR, s.webglP, s.mathFP, s.screen,
     s.tz, s.locale, s.platform, s.cores, s.touch, s.vendor, s.productSub
   ].join("|");
   return crypto.createHash("sha256").update(basis).digest("hex");
@@ -140,6 +146,7 @@ function touch(r, ip, sig, nonce, keyId) {
 function identify(sig, ip) {
   const keyId = (sig.keyId && sig.keyId !== "na") ? sig.keyId : null;
   const nonce = (sig.nonce && sig.nonce !== "na") ? sig.nonce : null;
+  const incognito = sig.incognito === "1" || sig.incognito === true;
   const h = coreHash(sig);
   stats.total++;
 
@@ -168,7 +175,9 @@ function identify(sig, ip) {
   const freshUnitMarker =
     (keyId && exact && exact.keyIds.length > 0 && exact.keyIds.indexOf(keyId) === -1) ||
     (nonce && exact && exact.nonces.length > 0 && exact.nonces.indexOf(nonce) === -1);
-  const splitUnit = UNIQUE_UNITS && exact && exact.ips.indexOf(ip) !== -1 && freshUnitMarker;
+  // In incognito the keyId/nonce are absent or throwaway, so NEVER split — that
+  // would mint a bogus new id for a device we'd otherwise recognise by fingerprint.
+  const splitUnit = UNIQUE_UNITS && !incognito && exact && exact.ips.indexOf(ip) !== -1 && freshUnitMarker;
 
   if (!splitUnit) {
     // 2) exact device match — works even across networks / IP changes.
@@ -211,7 +220,7 @@ function identify(sig, ip) {
   // 4) new identity (also the unit-split path)
   const r = {
     id: newId(), hashes: [h], nonces: nonce ? [nonce] : [], keyIds: keyId ? [keyId] : [],
-    ips: ip ? [ip] : [], sig: sig, createdAt: Date.now(), lastSeen: Date.now()
+    ecTokens: [], ips: ip ? [ip] : [], sig: sig, createdAt: Date.now(), lastSeen: Date.now()
   };
   records.push(r);
   byCore.set(h, r);                 // newest unit wins the bare-fingerprint mapping
@@ -301,6 +310,37 @@ const server = http.createServer((req, res) => {
       topSuspects: suspects.slice(0, 25),             // most-merged identities — inspect these
       recentRiskyMerges: fuzzyLog.slice(-50)          // fuzzy + bare-exact merges with an unseen keyId
     }, null, 2));
+  }
+
+  // Evercookie: a token pinned in the browser HTTP cache (ETag) that survives a
+  // localStorage/IndexedDB clear. GET mints/echoes a token + reports any recovered
+  // id; GET ?bind=<token>&id=<id> binds the token to an identity.
+  if (req.method === "GET" && url === "/ec") {
+    cors(res, origin);
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Cache-Control", "no-cache, private");
+    const q = (req.url.split("?")[1] || "").split("&").reduce((a, kv) => { const [k, v] = kv.split("="); a[k] = decodeURIComponent(v || ""); return a; }, {});
+
+    // bind token -> id
+    if (q.bind && /^ntrx_[0-9a-f]+$/.test(q.id || "")) {
+      const rec = records.find(r => r.id === q.id);
+      if (rec) {
+        if (!rec.ecTokens) rec.ecTokens = [];
+        if (rec.ecTokens.indexOf(q.bind) === -1) { rec.ecTokens.push(q.bind); byEcToken.set(q.bind, rec); save(); }
+      }
+      res.setHeader("ETag", '"ec:' + q.bind + '"');
+      res.writeHead(200); return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // mint / recover: read token from If-None-Match (browser auto-sends cached ETag)
+    const inm = req.headers["if-none-match"] || "";
+    const m = inm.match(/ec:([a-z0-9]+)/i);
+    let token = m ? m[1] : null;
+    let recovered = null;
+    if (token && byEcToken.has(token)) recovered = byEcToken.get(token).id;
+    if (!token) token = crypto.randomBytes(16).toString("hex");
+    res.setHeader("ETag", '"ec:' + token + '"');
+    res.writeHead(200); return res.end(JSON.stringify({ token: token, recovered: recovered }));
   }
 
   if (req.method === "GET" && url === "/health") {
